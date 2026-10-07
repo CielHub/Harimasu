@@ -260,16 +260,16 @@ class AndroidShell:
 
     def kill_exact_pid(self, pid: int, package: str) -> bool:
         """
-        Safely terminate one exact PID with SIGTERM.
+        Stop the verified target package through Android Activity Manager.
 
-        IMPORTANT: this intentionally does NOT use kill -9 and does NOT use
-        package-level stopping commands such as am force-stop.
+        The PID is still used for strict target validation, but the actual
+        termination is package-scoped via `am force-stop`.
         """
         if not self.verify_pid_for_package(pid, package):
             return False
         if not str(pid).isdigit() or pid <= 1:
             return False
-        result = self.run_su(f"kill -15 {pid}", timeout=5)
+        result = self.run_su(f"am force-stop {shlex.quote(package)}", timeout=5)
         return result.code == 0
 
 
