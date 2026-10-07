@@ -158,6 +158,7 @@ class AndroidShell:
             completed = subprocess.run(
                 ["su", "-c", command],
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -683,6 +684,7 @@ class LogcatSensor(threading.Thread):
         with self.process_lock:
             self.process = subprocess.Popen(
                 ["su", "-c", "exec logcat -v threadtime"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -749,8 +751,123 @@ class LogcatSensor(threading.Thread):
                 pass
 
 
+class TerminalIO:
+    """Centralized terminal-state handling for Termux/Android.
+
+    The old implementation changed stdin into cbreak mode only inside the
+    dashboard. On some Android terminal/floating-window combinations, an
+    interrupted process could leave ECHO/ICANON altered, making the next
+    input("") appear to be "dead". This class always restores a normal line
+    terminal before menu input and again during shutdown.
+    """
+
+    _lock = threading.RLock()
+    _saved_attrs = None
+
+    @classmethod
+    def _tty(cls):
+        try:
+            if sys.stdin.isatty():
+                return sys.stdin
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def restore_normal(cls) -> None:
+        """Force normal line input with visible typed characters."""
+        tty_stream = cls._tty()
+        if tty_stream is None:
+            return
+        with cls._lock:
+            try:
+                attrs = termios.tcgetattr(tty_stream)
+                # Explicitly restore the flags most important for input("").
+                attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN
+                attrs[6][termios.VMIN] = 1
+                attrs[6][termios.VTIME] = 0
+                termios.tcsetattr(tty_stream, termios.TCSADRAIN, attrs)
+            except Exception:
+                pass
+
+    @classmethod
+    def enter_cbreak(cls) -> bool:
+        """Enable single-key dashboard input while keeping ECHO enabled."""
+        tty_stream = cls._tty()
+        if tty_stream is None:
+            return False
+        with cls._lock:
+            try:
+                cls._saved_attrs = termios.tcgetattr(tty_stream)
+                attrs = termios.tcgetattr(tty_stream)
+                attrs[3] &= ~(termios.ICANON)
+                attrs[3] |= termios.ECHO | termios.ISIG | termios.IEXTEN
+                attrs[6][termios.VMIN] = 0
+                attrs[6][termios.VTIME] = 1
+                termios.tcsetattr(tty_stream, termios.TCSADRAIN, attrs)
+                return True
+            except Exception:
+                cls._saved_attrs = None
+                return False
+
+    @classmethod
+    def leave_cbreak(cls) -> None:
+        tty_stream = cls._tty()
+        if tty_stream is None:
+            return
+        with cls._lock:
+            try:
+                if cls._saved_attrs is not None:
+                    termios.tcsetattr(tty_stream, termios.TCSADRAIN, cls._saved_attrs)
+            except Exception:
+                pass
+            finally:
+                cls._saved_attrs = None
+                cls.restore_normal()
+
+    @classmethod
+    def safe_line_input(cls, prompt: str) -> str:
+        """Restore normal echo before every blocking input("") call."""
+        cls.restore_normal()
+        try:
+            return input(prompt)
+        finally:
+            cls.restore_normal()
+
+    @staticmethod
+    def terminal_columns(default: int = 60) -> int:
+        try:
+            columns = shutil.get_terminal_size((default, 24)).columns
+            if columns and columns > 0:
+                return int(columns)
+        except Exception:
+            pass
+        return default
+
+    @classmethod
+    def clear(cls) -> None:
+        """Clear using the terminal's own clear command when possible."""
+        cls.restore_normal()
+        try:
+            # TERM may be unset in some rooted/floating Termux windows.
+            if os.environ.get("TERM"):
+                subprocess.run(
+                    ["clear"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=sys.stdout,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+                return
+        except Exception:
+            pass
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
 class Dashboard:
-    """Small adaptive-width dashboard designed for Termux/Android screens."""
+    """Adaptive dashboard designed for Termux portrait and landscape modes."""
 
     def __init__(self, manager: RobloxManager, shutdown_event: threading.Event):
         self.manager = manager
@@ -759,11 +876,13 @@ class Dashboard:
 
     @staticmethod
     def _fit(text: str, width: int) -> str:
-        text = str(text)
+        text = str(text).replace("\t", " ")
+        if width <= 0:
+            return ""
         if len(text) > width:
-            if width <= 1:
-                return text[:width]
-            return text[: width - 1] + "~"
+            if width == 1:
+                return text[:1]
+            return text[:width - 1] + "~"
         return text.ljust(width)
 
     @staticmethod
@@ -775,80 +894,124 @@ class Dashboard:
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def _draw(self) -> None:
-        terminal_columns = shutil.get_terminal_size((72, 24)).columns
-        width = max(44, min(terminal_columns, 100))
+    @staticmethod
+    def _width() -> int:
+        cols = TerminalIO.terminal_columns(60)
+        # Never build a giant box. It looks much cleaner in Android floating
+        # windows and avoids accidental wrapping from bad COLUMNS values.
+        return max(34, min(cols - 1, 78))
 
-        # Keep the dashboard usable even in narrow portrait-mode Termux.
-        num_w = 3
-        pid_w = 8
+    def _draw_wide(self, width: int, rows: List[dict], cfg: dict) -> List[str]:
+        inner = width - 2
+        # At >=60 columns we can keep a real table.
+        num_w = 2
+        pid_w = 7
         online_w = 8
-        status_w = 14
-        package_w = max(10, width - (num_w + pid_w + online_w + status_w + 8))
+        status_w = 13
+        package_w = max(12, inner - (num_w + pid_w + online_w + status_w + 8))
 
-        rows = []
-        for index, instance in enumerate(self.manager.instances_snapshot(), start=1):
-            snap = instance.snapshot()
+        def row_text(index: int, snap: dict) -> str:
             pids = snap["pids"]
             pid_text = str(pids[0]) if pids else "-"
             if len(pids) > 1:
                 pid_text += f" +{len(pids)-1}"
-            rows.append(
-                f"{self._fit(index, num_w)} "
-                f"{self._fit(snap['package'], package_w)} "
-                f"{self._fit(pid_text, pid_w)} "
-                f"{self._fit(self._uptime(snap['online_since']), online_w)} "
-                f"{self._fit(snap['status'], status_w)}"
-            )
+            parts = [
+                self._fit(index, num_w),
+                self._fit(snap["package"], package_w),
+                self._fit(pid_text, pid_w),
+                self._fit(self._uptime(snap["online_since"]), online_w),
+                self._fit(snap["status"], status_w),
+            ]
+            return " ".join(parts)
 
-        inner = width - 2
-        cfg = self.manager.config.load()
+        header = " ".join([
+            self._fit("#", num_w),
+            self._fit("Package", package_w),
+            self._fit("PID", pid_w),
+            self._fit("Online", online_w),
+            self._fit("Status", status_w),
+        ])
+
         lines = [
-            ANSI_CLEAR,
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit(f"Place ID: {cfg['place_id']}  |  Lobby: {cfg['lobby_delay']}s", inner)}|",
+            f"|{self._fit('Place ID: '+str(cfg['place_id'])+'  |  Lobby: '+str(cfg['lobby_delay'])+'s', inner)}|",
             f"+{'-' * inner}+",
-            f"|{self._fit('#', num_w)} {self._fit('Package Name', package_w)} {self._fit('PID', pid_w)} {self._fit('Online', online_w)} {self._fit('Status', status_w)}|",
+            f"|{self._fit(header, inner)}|",
             f"+{'-' * inner}+",
         ]
-        lines.extend(f"|{self._fit(row, inner)}|" for row in rows)
-        if not rows:
+        if rows:
+            for index, snap in enumerate(rows, start=1):
+                lines.append(f"|{self._fit(row_text(index, snap), inner)}|")
+        else:
             lines.append(f"|{self._fit('No active session.', inner)}|")
+        return lines
 
-        lines += [
-            f"+{'-' * inner}+",
-            f"|{self._fit('Keys: [q] Quit  [s] Stop+Menu  [r] Refresh PID  [l] Logs', inner)}|",
+    def _draw_compact(self, width: int, rows: List[dict], cfg: dict) -> List[str]:
+        """Portrait mode: two short lines per clone, no horizontal wrapping."""
+        inner = width - 2
+        lines = [
             f"+{'=' * inner}+",
+            f"|{self._fit(APP_NAME, inner)}|",
+            f"|{self._fit('Place:'+str(cfg['place_id'])+'  Lobby:'+str(cfg['lobby_delay'])+'s', inner)}|",
+            f"+{'-' * inner}+",
         ]
+        if rows:
+            for index, snap in enumerate(rows, start=1):
+                pids = snap["pids"]
+                pid_text = str(pids[0]) if pids else "-"
+                if len(pids) > 1:
+                    pid_text += f"+{len(pids)-1}"
+                package = snap["package"]
+                line1 = f"{index}. {package}"
+                line2 = f"PID:{pid_text}  ON:{self._uptime(snap['online_since'])}"
+                line2 += f"  {snap['status']}"
+                lines.append(f"|{self._fit(line1, inner)}|")
+                lines.append(f"|{self._fit(line2, inner)}|")
+                lines.append(f"+{'-' * inner}+")
+        else:
+            lines.append(f"|{self._fit('No active session.', inner)}|")
+            lines.append(f"+{'-' * inner}+")
+        return lines
+
+    def _draw(self) -> None:
+        width = self._width()
+        cfg = self.manager.config.load()
+        snapshots = [i.snapshot() for i in self.manager.instances_snapshot()]
+
+        if width >= 60:
+            lines = self._draw_wide(width, snapshots, cfg)
+        else:
+            lines = self._draw_compact(width, snapshots, cfg)
+
+        inner = width - 2
+        lines.extend([
+            f"|{self._fit('Keys: [q] Quit  [s] Stop  [r] Refresh  [l] Logs', inner)}|",
+            f"+{'=' * inner}+",
+        ])
 
         if self.show_logs:
             lines.append("Events:")
-            for instance in self.manager.instances_snapshot():
-                snap = instance.snapshot()
+            for snap in snapshots:
                 for event in snap["events"][-2:]:
-                    event_line = f"  {snap['package']}: {event}"
-                    lines.append(self._fit(event_line, width))
+                    lines.append(self._fit(f"{snap['package']}: {event}", width))
 
-        sys.stdout.write("\n".join(lines) + "\n")
+        # One write reduces flicker and prevents background output from
+        # splitting the dashboard into multiple chunks.
+        sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
         sys.stdout.flush()
 
     def run(self) -> str:
         """Return 'menu' or 'quit'."""
-        raw_mode = sys.stdin.isatty() and sys.stdout.isatty()
-        old_attrs = None
-
+        raw_mode = TerminalIO.enter_cbreak()
         try:
-            if raw_mode:
-                old_attrs = termios.tcgetattr(sys.stdin)
-                tty.setcbreak(sys.stdin.fileno())
-                sys.stdout.write(ANSI_HIDE_CURSOR)
-                sys.stdout.flush()
-
             while not self.shutdown_event.is_set():
                 self._draw()
                 if raw_mode:
-                    ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+                    try:
+                        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+                    except (OSError, ValueError):
+                        ready = []
                     if ready:
                         key = sys.stdin.read(1).lower()
                         if key == "q":
@@ -859,19 +1022,13 @@ class Dashboard:
                             return "menu"
                         if key == "r":
                             self.manager.refresh_pids()
-                        if key == "l":
+                        elif key == "l":
                             self.show_logs = not self.show_logs
                 else:
+                    # Non-TTY mode: stay headless and do not attempt terminal input.
                     self.shutdown_event.wait(1.0)
         finally:
-            if raw_mode and old_attrs is not None:
-                try:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
-                except Exception:
-                    pass
-            sys.stdout.write(ANSI_SHOW_CURSOR)
-            sys.stdout.flush()
-
+            TerminalIO.leave_cbreak()
         return "quit"
 
 
@@ -888,6 +1045,7 @@ class AutoRejoinRobloxApp:
 
     def run(self) -> None:
         try:
+            TerminalIO.restore_normal()
             self.config.ensure()
             self.shell.require_root()
             self.packages = self.scanner.scan()
@@ -900,7 +1058,7 @@ class AutoRejoinRobloxApp:
             self._safe_print(f"\nERROR: {exc}")
             self._safe_print("Tekan Enter untuk keluar...")
             try:
-                input()
+                input("")
             except EOFError:
                 pass
         finally:
@@ -912,25 +1070,41 @@ class AutoRejoinRobloxApp:
         if not self.logcat_sensor.is_alive():
             self.logcat_sensor.start()
 
+    def _box(self, lines: List[str], title: Optional[str] = None) -> None:
+        """Render a compact left-aligned box that survives portrait mode."""
+        cols = TerminalIO.terminal_columns(60)
+        width = max(34, min(cols - 1, 78))
+        inner = width - 2
+        output = [f"+{'=' * inner}+"]
+        if title:
+            output.append(f"|{Dashboard._fit(title, inner)}|")
+            output.append(f"+{'-' * inner}+")
+        for line in lines:
+            output.append(f"|{Dashboard._fit(line, inner)}|")
+        output.append(f"+{'=' * inner}+")
+        sys.stdout.write("\n".join(output) + "\n")
+        sys.stdout.flush()
+
     def _main_menu(self) -> None:
         while not self.shutdown_event.is_set():
-            self._clear_screen()
+            TerminalIO.clear()
             cfg = self.config.load()
-            self._safe_print("=" * 60)
-            self._safe_print("           AUTO REJOIN ROBLOX")
-            self._safe_print("=" * 60)
-            self._safe_print(f"Packages terdeteksi : {len(self.packages)}")
-            self._safe_print(f"Lobby delay        : {cfg['lobby_delay']} detik")
-            self._safe_print(f"Place ID           : {cfg['place_id']}")
-            self._safe_print("-")
-            self._safe_print("[1] Mulai / Start AFK")
-            self._safe_print("[2] Setting")
-            self._safe_print("[3] Keluar / Exit")
-            self._safe_print("=" * 60)
+            self._box(
+                [
+                    f"Packages terdeteksi : {len(self.packages)}",
+                    f"Lobby delay        : {cfg['lobby_delay']} detik",
+                    f"Place ID           : {cfg['place_id']}",
+                    "",
+                    "[1] Mulai / Start AFK",
+                    "[2] Setting",
+                    "[3] Keluar / Exit",
+                ],
+                APP_NAME,
+            )
 
             try:
-                choice = input("Pilih: ").strip()
-            except EOFError:
+                choice = TerminalIO.safe_line_input("Pilih: ").strip()
+            except (EOFError, KeyboardInterrupt):
                 return
 
             if choice == "1":
@@ -945,38 +1119,42 @@ class AutoRejoinRobloxApp:
 
     def _start_menu(self) -> None:
         self.packages = self.scanner.scan()
-        self._clear_screen()
-        self._safe_print("=" * 60)
-        self._safe_print("SELECT ROBLOX PACKAGES")
-        self._safe_print("=" * 60)
+        TerminalIO.clear()
 
         if not self.packages:
-            self._safe_print("Tidak ada package Roblox yang terdeteksi.")
-            input("Enter untuk kembali...")
+            self._box(["Tidak ada package Roblox yang terdeteksi.", "Tekan Enter untuk kembali."], "PILIH PACKAGE")
+            try:
+                input("")
+            except (EOFError, KeyboardInterrupt):
+                pass
             return
 
+        cols = TerminalIO.terminal_columns(60)
+        width = max(34, min(cols - 1, 78))
+        inner = width - 2
+        lines = []
         for idx, package in enumerate(self.packages, start=1):
-            self._safe_print(f"{idx:>2}. {package}")
+            # Always keep the selection number visible even when portrait mode
+            # is extremely narrow.
+            lines.append(f"{idx:>2}. {package}")
+        lines.extend(["", "Contoh: 1,2,4"])
+        self._box(lines, "PILIH ROBLOX PACKAGE")
 
-        self._safe_print("-")
-        self._safe_print("Masukkan contoh: 1,2,4")
         try:
-            raw = input("Pilih package: ").strip()
-        except EOFError:
+            raw = TerminalIO.safe_line_input("Pilih package: ").strip()
+        except (EOFError, KeyboardInterrupt):
             return
 
         selected = self._parse_selection(raw, len(self.packages))
         if not selected:
             self._safe_print("Tidak ada pilihan yang valid.")
-            time.sleep(1.5)
+            time.sleep(1.2)
             return
 
         selected_packages = [self.packages[i - 1] for i in selected]
         self.manager.start_sessions(selected_packages)
         dashboard = Dashboard(self.manager, self.shutdown_event)
-        result = dashboard.run()
-        if result == "quit":
-            return
+        dashboard.run()
 
     @staticmethod
     def _parse_selection(raw: str, maximum: int) -> List[int]:
@@ -992,46 +1170,52 @@ class AutoRejoinRobloxApp:
     def _settings_menu(self) -> None:
         while not self.shutdown_event.is_set():
             cfg = self.config.load()
-            self._clear_screen()
-            self._safe_print("=" * 60)
-            self._safe_print("SETTING")
-            self._safe_print("=" * 60)
-            self._safe_print(f"1. Lobby delay : {cfg['lobby_delay']} detik")
-            self._safe_print(f"2. Place ID    : {cfg['place_id']}")
-            self._safe_print("0. Kembali")
-            self._safe_print("=" * 60)
+            TerminalIO.clear()
+            self._box(
+                [
+                    f"1. Lobby delay : {cfg['lobby_delay']} detik",
+                    f"2. Place ID    : {cfg['place_id']}",
+                    "",
+                    "0. Kembali",
+                ],
+                "SETTING",
+            )
 
             try:
-                choice = input("Pilih: ").strip()
-            except EOFError:
+                choice = TerminalIO.safe_line_input("Pilih: ").strip()
+            except (EOFError, KeyboardInterrupt):
                 return
 
             if choice == "0":
                 return
             if choice == "1":
                 try:
-                    value = int(input("Lobby delay (detik): ").strip())
+                    value = int(TerminalIO.safe_line_input("Lobby delay (detik): ").strip())
                     if value < 0:
                         raise ValueError
                     self.config.update(value, cfg["place_id"])
                     self._safe_print("Lobby delay disimpan.")
-                except ValueError:
+                except (ValueError, KeyboardInterrupt, EOFError):
                     self._safe_print("Nilai lobby delay harus angka >= 0.")
-                time.sleep(1.0)
+                time.sleep(0.8)
             elif choice == "2":
-                place_id = input("Place ID: ").strip()
+                try:
+                    place_id = TerminalIO.safe_line_input("Place ID: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return
                 if not place_id.isdigit():
                     self._safe_print("Place ID harus berupa angka.")
                 else:
                     self.config.update(cfg["lobby_delay"], place_id)
                     self._safe_print("Place ID disimpan.")
-                time.sleep(1.0)
+                time.sleep(0.8)
             else:
                 self._safe_print("Pilihan tidak valid.")
-                time.sleep(1.0)
+                time.sleep(0.8)
 
     def shutdown(self) -> None:
         self.shutdown_event.set()
+        TerminalIO.leave_cbreak()
         try:
             self.manager.stop_sessions(kill=True, clear=True)
         except Exception:
@@ -1052,8 +1236,7 @@ class AutoRejoinRobloxApp:
 
     @staticmethod
     def _clear_screen() -> None:
-        sys.stdout.write(ANSI_CLEAR)
-        sys.stdout.flush()
+        TerminalIO.clear()
 
     @staticmethod
     def _safe_print(text: str) -> None:
