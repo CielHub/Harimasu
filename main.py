@@ -43,6 +43,8 @@ APP_NAME = "Auto Rejoin Roblox"
 STARTUP_CONCURRENCY = 1
 STARTUP_STABILIZATION_DELAY = 12.0
 PID_MISSING_CONFIRMATIONS = 3
+WINDOW_MISSING_CONFIRMATIONS = 3
+WINDOW_SCAN_INTERVAL = 2.0
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -89,6 +91,10 @@ CRASH_PATTERNS = (
     re.compile(r"application not responding", re.I),
     re.compile(r"\banr\b", re.I),
     re.compile(r"out of memory", re.I),
+)
+
+WINDOW_ENTRY_RE = re.compile(
+    r"(?ms)^\s*Window #\d+\s+Window\{.*?(?=^\s*Window #\d+\s+Window\{|\Z)"
 )
 
 ANSI_CLEAR = "\033[2J\033[H"
@@ -249,6 +255,63 @@ class AndroidShell:
         raw = result.stdout.replace("\x00", "").strip()
         return raw.splitlines()[0].strip() if raw else ""
 
+    def window_packages(self, tracked_packages: Optional[List[str]] = None) -> Optional[set[str]]:
+        """Return tracked packages with a live Android WindowManager surface.
+
+        Returns None when WindowManager inspection itself fails. A failed
+        inspection must never be interpreted as "all Roblox windows are gone".
+        """
+        result = self.run_su("dumpsys window windows", timeout=5)
+        if result.code != 0 or not result.stdout:
+            return None
+
+        tracked = set(tracked_packages or [])
+        if not tracked:
+            return set()
+
+        found: set[str] = set()
+        blocks = WINDOW_ENTRY_RE.findall(result.stdout)
+
+        if blocks:
+            for block in blocks:
+                # A package name inside WindowManager is not enough by itself;
+                # require evidence that the window currently owns a surface or
+                # is reported on-screen/visible. This works better with Zetsu
+                # floating windows than checking only the focused activity.
+                surface_alive = (
+                    "mHasSurface=true" in block
+                    or "isOnScreen=true" in block
+                    or "isVisible=true" in block
+                    or "mViewVisibility=0x0" in block
+                )
+                if not surface_alive:
+                    continue
+
+                for package in tracked:
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
+                        block,
+                    ):
+                        found.add(package)
+
+            return found
+
+        # Compatibility fallback for Android builds with a different dumpsys
+        # WindowManager layout. Do not require focus; just require the package
+        # to be represented in WindowManager while at least one live surface is
+        # reported. The three-check confirmation in refresh_pids() prevents
+        # transient formatting/state changes from triggering recovery.
+        if "mHasSurface=true" not in result.stdout and "isOnScreen=true" not in result.stdout:
+            return set()
+
+        for package in tracked:
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
+                result.stdout,
+            ):
+                found.add(package)
+        return found
+
     def launch_normal(self, package: str) -> CommandResult:
         pkg = shlex.quote(package)
         command = f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1"
@@ -320,6 +383,7 @@ class RobloxInstance:
         self.recovery_last_pid: Optional[int] = None
         self.last_known_pid: Optional[int] = None
         self.missing_pid_checks = 0
+        self.window_missing_checks = 0
         self.process_loss_queued = False
         self.last_error_fingerprint: Optional[Tuple[int, str]] = None
         self.last_error_time = 0.0
@@ -361,6 +425,19 @@ class RobloxInstance:
             self.missing_pid_checks += 1
             return self.missing_pid_checks
 
+    def note_window_missing(self) -> int:
+        """Record one consecutive live-PID/window-missing check."""
+        with self.lock:
+            self.window_missing_checks += 1
+            return self.window_missing_checks
+
+    def note_window_present(self) -> None:
+        """Clear window-loss streak without resetting uptime."""
+        with self.lock:
+            self.window_missing_checks = 0
+            if self.status.startswith("Window Missing"):
+                self.status = "Running"
+
     def trigger_process_lost(self):
         """Mark a confirmed process loss and return a new launch generation."""
         with self.lock:
@@ -401,6 +478,7 @@ class RobloxInstance:
                 self.online_since = time.monotonic()
                 self.status = "Running"
                 self.missing_pid_checks = 0
+                self.window_missing_checks = 0
                 self.process_loss_queued = False
 
     def clear_uptime(self) -> None:
@@ -459,6 +537,9 @@ class RobloxManager:
         # the normal launch flow.
         self.startup_in_progress = False
         self.startup_run_id = 0
+        self._last_window_scan = 0.0
+        self._last_window_scan_success = False
+        self._window_packages_cache: set[str] = set()
 
     def instances_snapshot(self) -> List[RobloxInstance]:
         with self.lock:
@@ -788,10 +869,53 @@ class RobloxManager:
 
     def refresh_pids(self) -> None:
         new_map: Dict[int, str] = {}
+        now = time.monotonic()
+
         with self.lock:
             startup_in_progress = self.startup_in_progress
 
-        for instance in self.instances_snapshot():
+        instances = self.instances_snapshot()
+        tracked_packages = [
+            instance.package
+            for instance in instances
+            if instance.snapshot()["active"]
+        ]
+
+        # WindowManager is considerably more expensive than pidof(). Cache the
+        # result briefly so the watchdog does not hammer dumpsys every second on
+        # a low-spec Android device. A failed scan is treated as "unknown", not
+        # as "all windows missing".
+        window_packages: Optional[set[str]] = None
+        if tracked_packages:
+            try:
+                with self.lock:
+                    should_scan_windows = (
+                        now - getattr(self, "_last_window_scan", 0.0)
+                        >= WINDOW_SCAN_INTERVAL
+                    )
+                    cached_windows = set(getattr(self, "_window_packages_cache", set()))
+                    last_scan_success = getattr(self, "_last_window_scan_success", False)
+
+                if should_scan_windows:
+                    scanned = self.shell.window_packages(tracked_packages)
+                    with self.lock:
+                        self._last_window_scan = now
+                        if scanned is not None:
+                            self._window_packages_cache = set(scanned)
+                            self._last_window_scan_success = True
+                        else:
+                            self._last_window_scan_success = False
+                            cached_windows = set()
+                        window_packages = (
+                            set(scanned) if scanned is not None
+                            else None
+                        )
+                else:
+                    window_packages = cached_windows if last_scan_success else None
+            except Exception:
+                window_packages = None
+
+        for instance in instances:
             snap = instance.snapshot()
             if not snap["active"]:
                 continue
@@ -801,13 +925,9 @@ class RobloxManager:
             except Exception:
                 pids = []
 
-            if pids:
-                instance.update_pids(pids)
-            else:
-                # The initial sequential startup must protect only instances
-                # that have NOT reached a real online state yet. An instance
-                # that was already Running is a fully monitored session, even
-                # while a later clone is still being started.
+            if not pids:
+                # PID-loss recovery has priority over window-loss recovery.
+                # A dead process is always a full relaunch case.
                 has_been_online = snap["online_since"] is not None
                 if startup_in_progress and not has_been_online:
                     instance.update_pids([])
@@ -829,6 +949,43 @@ class RobloxManager:
                                 name=f"process-lost-{instance.package}",
                                 daemon=True,
                             ).start()
+            else:
+                instance.update_pids(pids)
+
+                # Window watchdog: only monitor instances that have actually
+                # reached Running state. Give every newly-online instance its
+                # normal stabilization window before declaring a missing UI.
+                has_been_online = snap["online_since"] is not None
+                window_watch_armed = (
+                    has_been_online
+                    and (
+                        not startup_in_progress
+                        or now - snap["online_since"] >= STARTUP_STABILIZATION_DELAY
+                    )
+                    and window_packages is not None
+                )
+
+                if window_watch_armed:
+                    if instance.package in window_packages:
+                        instance.note_window_present()
+                    else:
+                        missing_count = instance.note_window_missing()
+                        if missing_count < WINDOW_MISSING_CONFIRMATIONS:
+                            instance.set_status(
+                                f"Window Missing {missing_count}/{WINDOW_MISSING_CONFIRMATIONS}"
+                            )
+                        else:
+                            generation = instance.trigger_process_lost()
+                            if generation is not None:
+                                instance.add_event(
+                                    f"Window Lost: missing {WINDOW_MISSING_CONFIRMATIONS} checks; full relaunch"
+                                )
+                                threading.Thread(
+                                    target=self._launch_flow,
+                                    args=(instance, generation),
+                                    name=f"window-lost-{instance.package}",
+                                    daemon=True,
+                                ).start()
 
             for pid in pids:
                 new_map[pid] = instance.package
