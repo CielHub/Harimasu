@@ -57,8 +57,10 @@ THREADTIME_RE = re.compile(
     r"\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+([^:]+):\s*(.*)$"
 )
 
-DISCONNECT_267_RE = re.compile(r"\b267\b")
-DISCONNECT_277_RE = re.compile(r"\b277\b")
+ROBLOX_ERROR_RE = re.compile(
+    r"\b(264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
+)
+
 CRASH_PATTERNS = (
     re.compile(r"fatal exception", re.I),
     re.compile(r"fatal signal\s+\d+", re.I),
@@ -68,6 +70,7 @@ CRASH_PATTERNS = (
     re.compile(r"process .*\bhas died\b", re.I),
     re.compile(r"application not responding", re.I),
     re.compile(r"\banr\b", re.I),
+    re.compile(r"out of memory", re.I),
 )
 
 ANSI_CLEAR = "\033[2J\033[H"
@@ -536,7 +539,7 @@ class RobloxManager:
                 # Do not kill or force-stop the Roblox process.
                 # Give the error screen a short moment to settle first.
                 generation = instance.current_generation()
-                rejoin_deadline = time.monotonic() + 5.0
+                rejoin_deadline = time.monotonic() + 25.0
 
                 while True:
                     if (
@@ -765,13 +768,19 @@ class LogcatSensor(threading.Thread):
     @staticmethod
     def _detect_reason(tag: str, message: str) -> Optional[str]:
         text = f"{tag} {message}"
-        if DISCONNECT_267_RE.search(text):
-            return "Disconnect 267"
-        if DISCONNECT_277_RE.search(text):
-            return "Disconnect 277"
+
+        # Roblox error codes have priority over generic crash signatures.
+        error_match = ROBLOX_ERROR_RE.search(text)
+        if error_match:
+            code = error_match.group(1)
+            if code == "277":
+                return "Disconnect 277"
+            return f"Error {code}"
+
         for pattern in CRASH_PATTERNS:
             if pattern.search(text):
                 return f"Crash: {pattern.pattern}"
+
         return None
 
     def stop_process(self) -> None:
