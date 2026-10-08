@@ -42,6 +42,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 APP_NAME = "Auto Rejoin Roblox"
 STARTUP_CONCURRENCY = 1
 STARTUP_STABILIZATION_DELAY = 12.0
+PID_MISSING_CONFIRMATIONS = 3
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -317,6 +318,9 @@ class RobloxInstance:
         self.recovery_queue: queue.Queue[Tuple[int, str]] = queue.Queue(maxsize=1)
         self.recovery_thread: Optional[threading.Thread] = None
         self.recovery_last_pid: Optional[int] = None
+        self.last_known_pid: Optional[int] = None
+        self.missing_pid_checks = 0
+        self.process_loss_queued = False
         self.last_error_fingerprint: Optional[Tuple[int, str]] = None
         self.last_error_time = 0.0
 
@@ -343,6 +347,34 @@ class RobloxInstance:
     def update_pids(self, pids: List[int]) -> None:
         with self.lock:
             self.pids = list(pids)
+            if self.pids:
+                self.last_known_pid = self.pids[0]
+                self.missing_pid_checks = 0
+                self.process_loss_queued = False
+                if self.status.startswith("PID Missing"):
+                    self.status = "Running"
+
+    def note_pid_missing(self) -> int:
+        """Record one consecutive PID-missing check and return the count."""
+        with self.lock:
+            self.pids = []
+            self.missing_pid_checks += 1
+            return self.missing_pid_checks
+
+    def queue_process_lost_recovery(self, reason: str) -> bool:
+        """Queue recovery after a previously-running process is confirmed lost."""
+        with self.lock:
+            if not self.active or self.process_loss_queued:
+                return False
+            try:
+                self.recovery_queue.put_nowait((self.last_known_pid or 0, reason))
+            except queue.Full:
+                return False
+            self.process_loss_queued = True
+            self.generation += 1
+            self.online_since = None
+            self.status = "Process Lost"
+            return True
 
     def primary_pid(self) -> Optional[int]:
         with self.lock:
@@ -371,6 +403,8 @@ class RobloxInstance:
             if self.active:
                 self.online_since = time.monotonic()
                 self.status = "Running"
+                self.missing_pid_checks = 0
+                self.process_loss_queued = False
 
     def clear_uptime(self) -> None:
         with self.lock:
@@ -729,17 +763,44 @@ class RobloxManager:
 
     def refresh_pids(self) -> None:
         new_map: Dict[int, str] = {}
+        with self.lock:
+            startup_in_progress = self.startup_in_progress
+
         for instance in self.instances_snapshot():
             snap = instance.snapshot()
             if not snap["active"]:
                 continue
+
             try:
                 pids = self.shell.pidof(instance.package)
             except Exception:
                 pids = []
-            instance.update_pids(pids)
+
+            if pids:
+                instance.update_pids(pids)
+            else:
+                # During the initial sequential boot, PID gaps are expected
+                # while Android/Zetsu creates and transitions processes. The
+                # startup shield already suppresses logcat recovery; extend
+                # the same protection to PID-loss detection.
+                if startup_in_progress:
+                    instance.update_pids([])
+                elif snap["status"] == "Running" and snap["online_since"] is not None:
+                    missing_count = instance.note_pid_missing()
+                    if missing_count < PID_MISSING_CONFIRMATIONS:
+                        instance.set_status(
+                            f"PID Missing {missing_count}/{PID_MISSING_CONFIRMATIONS}"
+                        )
+                    else:
+                        queued = instance.queue_process_lost_recovery("Process Lost")
+                        if queued:
+                            instance.add_event(
+                                f"Process Lost: PID missing {PID_MISSING_CONFIRMATIONS} checks"
+                            )
+
             for pid in pids:
                 new_map[pid] = instance.package
+
         with self.pid_map_lock:
             self.pid_map = new_map
 
