@@ -62,6 +62,22 @@ ROBLOX_ERROR_RE = re.compile(
     r"\b(264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
 )
 
+# A bare number in logcat is not enough. The code must also appear in a
+# Roblox/error/disconnect-related context before it becomes a candidate.
+ROBLOX_ERROR_CONTEXT_RE = re.compile(
+    r"(?:\b(?:roblox|error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|"
+    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
+    r"|\b(?:264|266|267|268|270|273|275|279|280|286|403|524|600)\b.{0,24}"
+    r"\b(?:roblox|error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)\b)",
+    re.I,
+)
+
+HTTP_OR_STATUS_RE = re.compile(
+    r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:[_ ]code)?|response)\b"
+    r".{0,18}\b(?:403|524)\b",
+    re.I,
+)
+
 CRASH_PATTERNS = (
     re.compile(r"fatal exception", re.I),
     re.compile(r"fatal signal\s+\d+", re.I),
@@ -770,6 +786,13 @@ class LogcatSensor(threading.Thread):
         self.stop_event = stop_event
         self.process: Optional[subprocess.Popen] = None
         self.process_lock = threading.RLock()
+        # Candidate events are confirmed before recovery is triggered. This
+        # filters transient/noisy logcat messages produced during normal
+        # multi-instance operation. Keyed by exact PID + reason.
+        self.candidate_lock = threading.RLock()
+        self.candidates: Dict[Tuple[int, str], Tuple[float, int]] = {}
+        self.candidate_window = 4.0
+        self.candidate_max = 256
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -803,7 +826,9 @@ class LogcatSensor(threading.Thread):
                     continue
                 pid, _tid, tag, message = parsed
                 reason = self._detect_reason(tag, message)
-                if reason:
+                if reason and self._confirm_candidate(pid, reason):
+                    # Only confirmed events reach the manager. PID/package
+                    # validation is still performed there as before.
                     self.manager.handle_sensor_event(pid, reason, line)
         finally:
             with self.process_lock:
@@ -832,10 +857,22 @@ class LogcatSensor(threading.Thread):
     def _detect_reason(tag: str, message: str) -> Optional[str]:
         text = f"{tag} {message}"
 
-        # Roblox error codes have priority over generic crash signatures.
+        # Ignore HTTP/status-style 403/524 values. These are often ordinary
+        # network diagnostics rather than an actual Roblox client error.
         error_match = ROBLOX_ERROR_RE.search(text)
         if error_match:
             code = error_match.group(1)
+            if code in {"403", "524"} and HTTP_OR_STATUS_RE.search(text):
+                return None
+
+            # A matching number is only a candidate when nearby text explicitly
+            # indicates Roblox/error/disconnect semantics. This prevents values
+            # such as packet sizes, HTTP counters, IDs, or unrelated integers
+            # from becoming recovery triggers.
+            context = ROBLOX_ERROR_CONTEXT_RE.search(text)
+            if context is None:
+                return None
+
             if code == "277":
                 return "Disconnect 277"
             return f"Error {code}"
@@ -845,6 +882,55 @@ class LogcatSensor(threading.Thread):
                 return f"Crash: {pattern.pattern}"
 
         return None
+
+    def _confirm_candidate(self, pid: int, reason: str) -> bool:
+        """Confirm noisy logcat candidates before starting package recovery.
+
+        Explicit Roblox disconnect codes 267/277 are considered strong signals
+        and may trigger immediately. Other error/crash candidates require two
+        matching events from the same PID within a short window.
+        """
+        if reason in {"Error 267", "Disconnect 277"}:
+            return True
+
+        now = time.monotonic()
+        key = (pid, reason)
+
+        with self.candidate_lock:
+            # Periodically prune stale entries to keep memory bounded during
+            # long 24-hour sessions.
+            stale_before = now - self.candidate_window
+            stale_keys = [
+                candidate_key
+                for candidate_key, (timestamp, _count) in self.candidates.items()
+                if timestamp < stale_before
+            ]
+            for candidate_key in stale_keys:
+                self.candidates.pop(candidate_key, None)
+
+            previous = self.candidates.get(key)
+            if previous is None:
+                self.candidates[key] = (now, 1)
+                if len(self.candidates) > self.candidate_max:
+                    oldest_key = min(
+                        self.candidates,
+                        key=lambda candidate_key: self.candidates[candidate_key][0],
+                    )
+                    self.candidates.pop(oldest_key, None)
+                return False
+
+            first_time, count = previous
+            if now - first_time > self.candidate_window:
+                self.candidates[key] = (now, 1)
+                return False
+
+            count += 1
+            if count >= 2:
+                self.candidates.pop(key, None)
+                return True
+
+            self.candidates[key] = (first_time, count)
+            return False
 
     def stop_process(self) -> None:
         with self.process_lock:
