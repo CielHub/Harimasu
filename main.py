@@ -563,6 +563,7 @@ class RobloxManager:
 
         # Wait for the process to appear before entering the lobby timer.
         pid_deadline = time.monotonic() + 12.0
+        pids: List[int] = []
         while time.monotonic() < pid_deadline:
             if not instance.is_current(generation) or self.shutdown_event.is_set():
                 return
@@ -573,6 +574,14 @@ class RobloxManager:
             self.shutdown_event.wait(0.5)
 
         if not instance.is_current(generation):
+            return
+
+        # Never let a launch flow advance to the lobby/deep-link stage while
+        # the target process is still missing. This keeps PID/state consistent
+        # and prevents a false "Running" state after a failed relaunch.
+        if not pids:
+            instance.add_event("Launch failed: PID did not appear")
+            instance.set_status("Launch Failed")
             return
 
         delay = int(cfg.get("lobby_delay", DEFAULT_CONFIG["lobby_delay"]))
@@ -593,9 +602,28 @@ class RobloxManager:
             instance.set_status("Join Failed")
             return
 
-        # Refresh once after the join intent.
-        time.sleep(0.5)
-        instance.update_pids(self.shell.pidof(package))
+        # Verify that the target process still exists after the join intent
+        # before declaring the instance online. This is especially important
+        # for Process Lost full-relaunch recovery.
+        verify_deadline = time.monotonic() + 8.0
+        pids = []
+        while time.monotonic() < verify_deadline:
+            if not instance.is_current(generation) or self.shutdown_event.is_set():
+                return
+            pids = self.shell.pidof(package)
+            instance.update_pids(pids)
+            if pids:
+                break
+            self.shutdown_event.wait(0.5)
+
+        if not instance.is_current(generation) or self.shutdown_event.is_set():
+            return
+
+        if not pids:
+            instance.add_event("Join failed: PID verification timeout")
+            instance.set_status("Join Failed")
+            return
+
         instance.set_online()
         instance.add_event("Session online")
 
@@ -776,13 +804,14 @@ class RobloxManager:
             if pids:
                 instance.update_pids(pids)
             else:
-                # During the initial sequential boot, PID gaps are expected
-                # while Android/Zetsu creates and transitions processes. The
-                # startup shield already suppresses logcat recovery; extend
-                # the same protection to PID-loss detection.
-                if startup_in_progress:
+                # The initial sequential startup must protect only instances
+                # that have NOT reached a real online state yet. An instance
+                # that was already Running is a fully monitored session, even
+                # while a later clone is still being started.
+                has_been_online = snap["online_since"] is not None
+                if startup_in_progress and not has_been_online:
                     instance.update_pids([])
-                elif snap["status"] == "Running" and snap["online_since"] is not None:
+                elif has_been_online:
                     missing_count = instance.note_pid_missing()
                     if missing_count < PID_MISSING_CONFIRMATIONS:
                         instance.set_status(
