@@ -530,28 +530,65 @@ class RobloxManager:
 
                 instance.recovery_last_pid = pid
                 instance.clear_uptime()
-                instance.set_status(f"Kill PID {pid}")
+                instance.set_status("Rejoining")
                 instance.add_event(f"Recovery: {reason}, PID {pid}")
 
-                killed = self.shell.kill_exact_pid(pid, instance.package)
-                if not killed:
-                    instance.add_event(f"Kill refused/failed for PID {pid}")
-                    instance.set_status("Kill Failed")
-                    continue
+                # Do not kill or force-stop the Roblox process.
+                # Give the error screen a short moment to settle first.
+                generation = instance.current_generation()
+                rejoin_deadline = time.monotonic() + 5.0
 
-                # Exactly 10 seconds measured from the successful kill command.
-                instance.set_status("Relaunch 10s")
-                kill_deadline = time.monotonic() + 10.0
                 while True:
-                    if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                    if (
+                        self.shutdown_event.is_set()
+                        or not instance.is_current(generation)
+                    ):
                         return
-                    remaining = kill_deadline - time.monotonic()
+
+                    remaining = rejoin_deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    instance.set_status(f"Relaunch {int(remaining + 0.999):02d}s")
+
                     self.shutdown_event.wait(min(0.25, remaining))
 
-                # If another recovery is already queued, handle that event first.
+                if (
+                    not instance.is_current(generation)
+                    or self.shutdown_event.is_set()
+                ):
+                    return
+
+                cfg = self.config.load()
+
+                instance.add_event(
+                    f"Rejoining Place {cfg['place_id']}"
+                )
+                instance.set_status("Rejoining")
+
+                # Recovery bypasses the normal launch flow.
+                # Keep the Roblox process alive and send only the deep-link
+                # intent to the target package.
+                join_result = self.shell.open_deep_link(
+                    instance.package,
+                    cfg["place_id"],
+                )
+
+                if join_result.code != 0:
+                    instance.add_event(
+                        f"Deep link failed ({join_result.code})"
+                    )
+                    instance.set_status("Join Failed")
+                    continue
+
+                if (
+                    not instance.is_current(generation)
+                    or self.shutdown_event.is_set()
+                ):
+                    return
+
+                instance.set_online()
+                instance.add_event("Rejoin successful")
+
+                # Preserve the existing queued-recovery handling.
                 try:
                     queued = instance.recovery_queue.get_nowait()
                 except queue.Empty:
@@ -564,9 +601,6 @@ class RobloxManager:
                         pass
                     continue
 
-                generation = instance.current_generation()
-                instance.set_status("Relaunching")
-                self._launch_flow(instance, generation)
             finally:
                 instance.recovery_queue.task_done()
 
