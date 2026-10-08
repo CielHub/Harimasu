@@ -361,20 +361,17 @@ class RobloxInstance:
             self.missing_pid_checks += 1
             return self.missing_pid_checks
 
-    def queue_process_lost_recovery(self, reason: str) -> bool:
-        """Queue recovery after a previously-running process is confirmed lost."""
+    def trigger_process_lost(self):
+        """Mark a confirmed process loss and return a new launch generation."""
         with self.lock:
             if not self.active or self.process_loss_queued:
-                return False
-            try:
-                self.recovery_queue.put_nowait((self.last_known_pid or 0, reason))
-            except queue.Full:
-                return False
-            self.process_loss_queued = True
+                return None
+
             self.generation += 1
             self.online_since = None
             self.status = "Process Lost"
-            return True
+            self.process_loss_queued = True
+            return self.generation
 
     def primary_pid(self) -> Optional[int]:
         with self.lock:
@@ -792,11 +789,17 @@ class RobloxManager:
                             f"PID Missing {missing_count}/{PID_MISSING_CONFIRMATIONS}"
                         )
                     else:
-                        queued = instance.queue_process_lost_recovery("Process Lost")
-                        if queued:
+                        generation = instance.trigger_process_lost()
+                        if generation is not None:
                             instance.add_event(
-                                f"Process Lost: PID missing {PID_MISSING_CONFIRMATIONS} checks"
+                                f"Process Lost: PID missing {PID_MISSING_CONFIRMATIONS} checks; relaunching"
                             )
+                            threading.Thread(
+                                target=self._launch_flow,
+                                args=(instance, generation),
+                                name=f"process-lost-{instance.package}",
+                                daemon=True,
+                            ).start()
 
             for pid in pids:
                 new_map[pid] = instance.package
