@@ -40,7 +40,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 
 APP_NAME = "Auto Rejoin Roblox"
-STARTUP_CONCURRENCY = 2
+STARTUP_CONCURRENCY = 1
+STARTUP_STABILIZATION_DELAY = 12.0
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -419,16 +420,49 @@ class RobloxManager:
         for instance in self.instances_snapshot():
             self._start_recovery_worker(instance)
 
-        # Launch selected clones in parallel. Android remains the authority on
-        # the actual window/foreground state, while each Python worker stays isolated.
+        # Initial startup is deliberately FULLY SEQUENTIAL. Only the startup
+        # coordinator runs in the background, so the dashboard/main thread
+        # remains responsive while Android gets breathing room between clones.
+        startup_thread = threading.Thread(
+            target=self._sequential_startup_worker,
+            name="sequential-startup",
+            daemon=True,
+        )
+        startup_thread.start()
+
+    def _sequential_startup_worker(self) -> None:
+        """Launch selected Roblox instances one at a time.
+
+        Each package completes its normal launch flow (including lobby delay
+        and deep-link) before the next package is started. After the deep-link
+        returns, wait a short stabilization period so the first instance can
+        render the map and settle CPU/RAM usage before starting the next one.
+        """
         for instance in self.instances_snapshot():
-            thread = threading.Thread(
-                target=self._launch_flow_entry,
-                args=(instance,),
-                name=f"launch-{instance.package}",
-                daemon=True,
-            )
-            thread.start()
+            if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                return
+
+            self._launch_flow_entry(instance)
+
+            if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                return
+
+            # _launch_flow_entry blocks until the package has either completed
+            # its normal flow or been invalidated. Only apply stabilization after
+            # a successful online transition, i.e. after open_deep_link ran.
+            snap = instance.snapshot()
+            if snap["status"] == "Running" and snap["online_since"] is not None:
+                instance.add_event(
+                    f"Startup stabilization {int(STARTUP_STABILIZATION_DELAY)}s"
+                )
+                deadline = time.monotonic() + STARTUP_STABILIZATION_DELAY
+                while True:
+                    if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.shutdown_event.wait(min(0.25, remaining))
 
     def _start_recovery_worker(self, instance: RobloxInstance) -> None:
         thread = threading.Thread(
