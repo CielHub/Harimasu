@@ -406,6 +406,12 @@ class RobloxManager:
         self.pid_map: Dict[int, str] = {}
         self.pid_map_lock = threading.RLock()
         self.startup_semaphore = threading.Semaphore(STARTUP_CONCURRENCY)
+        # True while the selected clones are going through the initial
+        # sequential boot + lobby + map + stabilization sequence. During this
+        # window Logcat errors are treated as startup noise and must not cancel
+        # the normal launch flow.
+        self.startup_in_progress = False
+        self.startup_run_id = 0
 
     def instances_snapshot(self) -> List[RobloxInstance]:
         with self.lock:
@@ -414,6 +420,9 @@ class RobloxManager:
     def start_sessions(self, packages: List[str]) -> None:
         self.stop_sessions(kill=False, clear=True)
         with self.lock:
+            self.startup_run_id += 1
+            startup_run_id = self.startup_run_id
+            self.startup_in_progress = True
             for package in packages:
                 self.instances[package] = RobloxInstance(package)
 
@@ -425,44 +434,56 @@ class RobloxManager:
         # remains responsive while Android gets breathing room between clones.
         startup_thread = threading.Thread(
             target=self._sequential_startup_worker,
+            args=(startup_run_id,),
             name="sequential-startup",
             daemon=True,
         )
         startup_thread.start()
 
-    def _sequential_startup_worker(self) -> None:
+    def _sequential_startup_worker(self, startup_run_id: int) -> None:
         """Launch selected Roblox instances one at a time.
 
         Each package completes its normal launch flow (including lobby delay
         and deep-link) before the next package is started. After the deep-link
         returns, wait a short stabilization period so the first instance can
         render the map and settle CPU/RAM usage before starting the next one.
+
+        Logcat recovery is intentionally disarmed for this entire initial
+        startup window. This prevents CPU/RAM loading noise from invalidating
+        the launch generation and leaving a clone stuck in the lobby.
         """
-        for instance in self.instances_snapshot():
-            if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
-                return
+        try:
+            for instance in self.instances_snapshot():
+                if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                    return
 
-            self._launch_flow_entry(instance)
+                self._launch_flow_entry(instance)
 
-            if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
-                return
+                if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                    return
 
-            # _launch_flow_entry blocks until the package has either completed
-            # its normal flow or been invalidated. Only apply stabilization after
-            # a successful online transition, i.e. after open_deep_link ran.
-            snap = instance.snapshot()
-            if snap["status"] == "Running" and snap["online_since"] is not None:
-                instance.add_event(
-                    f"Startup stabilization {int(STARTUP_STABILIZATION_DELAY)}s"
-                )
-                deadline = time.monotonic() + STARTUP_STABILIZATION_DELAY
-                while True:
-                    if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
-                        return
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self.shutdown_event.wait(min(0.25, remaining))
+                # _launch_flow_entry blocks until the package has either completed
+                # its normal flow or failed. Only apply stabilization after a
+                # successful online transition, i.e. after open_deep_link ran.
+                snap = instance.snapshot()
+                if snap["status"] == "Running" and snap["online_since"] is not None:
+                    instance.add_event(
+                        f"Startup stabilization {int(STARTUP_STABILIZATION_DELAY)}s"
+                    )
+                    deadline = time.monotonic() + STARTUP_STABILIZATION_DELAY
+                    while True:
+                        if self.shutdown_event.is_set() or not instance.snapshot()["active"]:
+                            return
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self.shutdown_event.wait(min(0.25, remaining))
+        finally:
+            with self.lock:
+                # A stale startup thread from an older session must never
+                # disable the startup shield of a newer session.
+                if self.startup_run_id == startup_run_id:
+                    self.startup_in_progress = False
 
     def _start_recovery_worker(self, instance: RobloxInstance) -> None:
         thread = threading.Thread(
@@ -642,6 +663,14 @@ class RobloxManager:
                 instance.recovery_queue.task_done()
 
     def handle_sensor_event(self, pid: int, reason: str, raw_line: str) -> None:
+        # During the initial multi-instance boot, Android/Zetsu can emit noisy
+        # logcat lines while CPU/RAM usage is peaking. Do not let those lines
+        # invalidate a normal launch flow. The detector itself remains running
+        # and resumes as soon as the final startup stabilization completes.
+        with self.lock:
+            if self.startup_in_progress:
+                return
+
         package = self.resolve_pid(pid)
         if not package:
             return
