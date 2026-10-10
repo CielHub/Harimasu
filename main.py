@@ -8,10 +8,10 @@ Android 10 + Termux + Magisk/KernelSU
 
 Features:
 - Automatic scan of installed Roblox clone packages.
-- Interactive menu + fixed-width terminal dashboard.
-- Per-package launch/recovery workers.
-- Logcat-based error sensor with exact PID extraction.
-- Exact-PID SIGTERM (kill -15) only. Never uses kill -9.
+- Adaptive Termux dashboard and sequential initial startup.
+- Per-package PID, WindowManager, ActivityManager and Logcat health signals.
+- Separate in-game rejoin and full relaunch recovery paths.
+- Bounded per-package relaunch retries; recovery never uses SIGKILL.
 - Config stored in config.json.
 
 Standard library only.
@@ -45,6 +45,12 @@ STARTUP_STABILIZATION_DELAY = 12.0
 PID_MISSING_CONFIRMATIONS = 3
 WINDOW_MISSING_CONFIRMATIONS = 3
 WINDOW_SCAN_INTERVAL = 2.0
+ACTIVITY_SCAN_INTERVAL = 8.0
+ACTIVITY_PROBLEM_CONFIRMATIONS = 2
+FULL_RELAUNCH_MAX_ATTEMPTS = 3
+FULL_RELAUNCH_RETRY_BASE = 5.0
+WINDOW_RESTORE_TIMEOUT = 12.0
+PROCESS_LOST_RETRY_COOLDOWN = 30.0
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -69,19 +75,20 @@ ROBLOX_ERROR_RE = re.compile(
 # together with "Error Code: 279". Requiring both the connection wording and
 # code 279 avoids treating an unrelated standalone number as this error.
 CONNECTION_FAILED_279_RE = re.compile(
-    r"(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost)|koneksi\s+gagal)"
-    r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*|kode\s*eror\s*[:#= -]?\s*)?279\b"
-    r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*|kode\s*eror\s*[:#= -]?\s*)?279\b"
-    r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost)|koneksi\s+gagal)",
+    r"(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))"
+    r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
+    r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
+    r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))",
     re.I,
 )
 
-# Bilingual context filter: require an error/Roblox/disconnect term near a
-# known Roblox code so unrelated numbers in ordinary logcat traffic are ignored.
+# A bare number or a generic tag named "Roblox" is not enough. The code must
+# be near explicit error/code/disconnect/kick language to become a candidate.
 ROBLOX_ERROR_CONTEXT_RE = re.compile(
-    r"(?:\b(?:roblox|error(?:\s*(?:code|id))?|eror(?:\s*(?:code|id))?|code|kode|disconnect(?:ed|ion)?|terputus|kicked|kick|keluar)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
-    r"|\b(?:264|266|267|268|270|273|275|279|280|286|403|524|600)\b.{0,24}"
-    r"\b(?:roblox|error(?:\s*(?:code|id))?|eror(?:\s*(?:code|id))?|code|kode|disconnect(?:ed|ion)?|terputus|kicked|kick|keluar)\b)",
+    r"(?:\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|"
+    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
+    r"|\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b.{0,24}"
+    r"\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)\b)",
     re.I,
 )
 
@@ -99,12 +106,23 @@ CRASH_PATTERNS = (
     re.compile(r"segmentation fault", re.I),
     re.compile(r"process .*\bhas died\b", re.I),
     re.compile(r"application not responding", re.I),
-    re.compile(r"\banr\b", re.I),
-    re.compile(r"out of memory", re.I),
+    re.compile(r"input dispatching timed out", re.I),
+    re.compile(r"\banr(?:\s+in)?\b", re.I),
+    re.compile(r"\boutofmemoryerror\b", re.I),
+    re.compile(r"out\s*of\s*memory", re.I),
+    re.compile(r"(?:lowmemorykiller|\blmkd\b).{0,100}\b(?:kill|killed|killing|oom)\b", re.I),
+    re.compile(r"\b(?:killed|killing)\b.{0,100}\b(?:memory pressure|out of memory|oom)\b", re.I),
 )
 
 WINDOW_ENTRY_RE = re.compile(
     r"(?ms)^\s*Window #\d+\s+Window\{.*?(?=^\s*Window #\d+\s+Window\{|\Z)"
+)
+ACTIVITY_PROCESS_HEADER_RE = re.compile(r"^\s*(?:\*APP\*|ProcessRecord\{)", re.I)
+ACTIVITY_BAD_STATE_RE = re.compile(
+    r"(?:\bnotResponding\s*=\s*true\b|\bcrashing\s*=\s*true\b|"
+    r"\bappNotResponding\b|input dispatching timed out|application not responding|"
+    r"\bANR in\b)",
+    re.I,
 )
 
 ANSI_CLEAR = "\033[2J\033[H"
@@ -181,7 +199,7 @@ class ConfigManager:
 
 
 class AndroidShell:
-    """Root command wrapper. Never invokes package-name killing."""
+    """Root command wrapper for package-scoped Android inspection and launch."""
 
     def __init__(self, command_timeout: float = 15.0):
         self.command_timeout = command_timeout
@@ -266,12 +284,13 @@ class AndroidShell:
         return raw.splitlines()[0].strip() if raw else ""
 
     def window_packages(self, tracked_packages: Optional[List[str]] = None) -> Optional[set[str]]:
-        """Return tracked packages with a live Android WindowManager surface.
+        """Return tracked packages with a visible WindowManager surface.
 
-        Returns None when WindowManager inspection itself fails. A failed
-        inspection must never be interpreted as "all Roblox windows are gone".
+        None means the output could not be interpreted reliably. It is safer
+        to skip one health sample than to mistake an Android-version format
+        change for every Roblox window having disappeared.
         """
-        result = self.run_su("dumpsys window windows", timeout=5)
+        result = self.run_su("dumpsys window windows", timeout=6)
         if result.code != 0 or not result.stdout:
             return None
 
@@ -279,48 +298,97 @@ class AndroidShell:
         if not tracked:
             return set()
 
+        output = result.stdout
+        blocks = WINDOW_ENTRY_RE.findall(output)
+        visibility_fields_present = bool(re.search(
+            r"\b(?:mHasSurface|isOnScreen|isVisible|mViewVisibility|isReadyForDisplay)\s*(?:\(\))?\s*=",
+            output,
+            re.I,
+        ))
+        if not visibility_fields_present:
+            return None
+
+        if not blocks:
+            # Unknown format: don't translate parser failure into "all windows
+            # are missing". That would cause a mass-relaunch on some OEM builds.
+            return None
+
         found: set[str] = set()
-        blocks = WINDOW_ENTRY_RE.findall(result.stdout)
-
-        if blocks:
-            for block in blocks:
-                # A package name inside WindowManager is not enough by itself;
-                # require evidence that the window currently owns a surface or
-                # is reported on-screen/visible. This works better with Zetsu
-                # floating windows than checking only the focused activity.
-                surface_alive = (
-                    "mHasSurface=true" in block
-                    or "isOnScreen=true" in block
-                    or "isVisible=true" in block
-                    or "mViewVisibility=0x0" in block
+        for block in blocks:
+            packages_in_block = [
+                package for package in tracked
+                if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
+                    block,
                 )
-                if not surface_alive:
-                    continue
+            ]
+            if not packages_in_block:
+                continue
 
-                for package in tracked:
-                    if re.search(
-                        rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
-                        block,
-                    ):
-                        found.add(package)
+            explicitly_hidden = bool(re.search(
+                r"(?:\bisOnScreen\s*=\s*false\b|\bisVisible\s*=\s*false\b|"
+                r"\bmViewVisibility\s*=\s*(?:0x8|8|GONE|INVISIBLE)\b|"
+                r"\bisReadyForDisplay\(\)\s*=\s*false\b)",
+                block,
+                re.I,
+            ))
+            has_surface = bool(re.search(r"\bmHasSurface\s*=\s*true\b", block, re.I))
+            visibly_present = bool(re.search(
+                r"(?:\bisOnScreen\s*=\s*true\b|\bisVisible\s*=\s*true\b|"
+                r"\bmViewVisibility\s*=\s*(?:0x0|0|VISIBLE)\b|"
+                r"\bisReadyForDisplay\(\)\s*=\s*true\b)",
+                block,
+                re.I,
+            ))
+            # mHasSurface=true alone can describe a stale/off-screen surface.
+            # Accept it only when WindowManager has no explicit hidden marker.
+            if not explicitly_hidden and (visibly_present or has_surface):
+                found.update(packages_in_block)
 
-            return found
-
-        # Compatibility fallback for Android builds with a different dumpsys
-        # WindowManager layout. Do not require focus; just require the package
-        # to be represented in WindowManager while at least one live surface is
-        # reported. The three-check confirmation in refresh_pids() prevents
-        # transient formatting/state changes from triggering recovery.
-        if "mHasSurface=true" not in result.stdout and "isOnScreen=true" not in result.stdout:
-            return set()
-
-        for package in tracked:
-            if re.search(
-                rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
-                result.stdout,
-            ):
-                found.add(package)
         return found
+
+    def activity_problem_packages(self, tracked_packages: Optional[List[str]] = None) -> Optional[Dict[str, str]]:
+        """Return packages explicitly marked crashing/not-responding by ActivityManager.
+
+        The parser only reports positive failure flags associated with the same
+        process record. Missing or unfamiliar dump structure returns None, not
+        an empty set, so an unparseable dump cannot cause mass recovery.
+        """
+        result = self.run_su("dumpsys activity processes", timeout=8)
+        if result.code != 0 or not result.stdout:
+            return None
+
+        tracked = set(tracked_packages or [])
+        if not tracked:
+            return {}
+
+        lines = result.stdout.splitlines()
+        header_indexes = [
+            index for index, line in enumerate(lines)
+            if ACTIVITY_PROCESS_HEADER_RE.search(line)
+        ]
+        if not header_indexes:
+            return None
+
+        problems: Dict[str, str] = {}
+        for pos, start in enumerate(header_indexes):
+            end = header_indexes[pos + 1] if pos + 1 < len(header_indexes) else len(lines)
+            block = "\n".join(lines[start:end])
+            matched_packages = [
+                package for package in tracked
+                if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])",
+                    block,
+                )
+            ]
+            if not matched_packages:
+                continue
+            bad_match = ACTIVITY_BAD_STATE_RE.search(block)
+            if bad_match:
+                signal = re.sub(r"\s+", " ", bad_match.group(0)).strip()
+                for package in matched_packages:
+                    problems[package] = signal
+        return problems
 
     def launch_normal(self, package: str) -> CommandResult:
         pkg = shlex.quote(package)
@@ -392,9 +460,17 @@ class RobloxInstance:
         self.recovery_thread: Optional[threading.Thread] = None
         self.recovery_last_pid: Optional[int] = None
         self.last_known_pid: Optional[int] = None
+        self.last_known_pid_at = 0.0
+        self.has_reached_running = False
+        self.window_seen = False
+        self.last_window_scan_serial = 0
+        self.last_activity_scan_serial = 0
         self.missing_pid_checks = 0
         self.window_missing_checks = 0
+        self.activity_problem_checks = 0
+        self.activity_problem_reason = ""
         self.process_loss_queued = False
+        self.process_loss_retry_after = 0.0
         self.last_error_fingerprint: Optional[Tuple[int, str]] = None
         self.last_error_time = 0.0
 
@@ -416,6 +492,12 @@ class RobloxInstance:
                 "status": self.status,
                 "last_event": self.last_event,
                 "events": list(self.events),
+                "has_reached_running": self.has_reached_running,
+                "window_seen": self.window_seen,
+                "process_loss_queued": self.process_loss_queued,
+                "missing_pid_checks": self.missing_pid_checks,
+                "window_missing_checks": self.window_missing_checks,
+                "activity_problem_checks": self.activity_problem_checks,
             }
 
     def update_pids(self, pids: List[int]) -> None:
@@ -423,9 +505,12 @@ class RobloxInstance:
             self.pids = list(pids)
             if self.pids:
                 self.last_known_pid = self.pids[0]
+                self.last_known_pid_at = time.monotonic()
                 self.missing_pid_checks = 0
-                self.process_loss_queued = False
-                if self.status.startswith("PID Missing"):
+                # Do not release a full-relaunch latch just because the old PID
+                # is still alive (especially after Window Lost). Only set_online
+                # or an exhausted-retry path may release it.
+                if self.status.startswith("PID Missing") and self.online_since is not None and not self.process_loss_queued:
                     self.status = "Running"
 
     def note_pid_missing(self) -> int:
@@ -435,30 +520,84 @@ class RobloxInstance:
             self.missing_pid_checks += 1
             return self.missing_pid_checks
 
-    def note_window_missing(self) -> int:
-        """Record one consecutive live-PID/window-missing check."""
+    def note_window_missing(self, scan_serial: Optional[int] = None) -> int:
+        """Count one fresh WindowManager sample, never a repeated cached result."""
         with self.lock:
+            if scan_serial is not None:
+                if scan_serial <= self.last_window_scan_serial:
+                    return self.window_missing_checks
+                self.last_window_scan_serial = scan_serial
             self.window_missing_checks += 1
             return self.window_missing_checks
 
-    def note_window_present(self) -> None:
-        """Clear window-loss streak without resetting uptime."""
+    def note_window_present(self, scan_serial: Optional[int] = None) -> None:
+        """Record a package window and clear the consecutive-missing streak."""
         with self.lock:
+            if scan_serial is not None:
+                if scan_serial < self.last_window_scan_serial:
+                    return
+                self.last_window_scan_serial = max(self.last_window_scan_serial, scan_serial)
+            self.window_seen = True
             self.window_missing_checks = 0
-            if self.status.startswith("Window Missing"):
+            if self.status.startswith("Window Missing") and self.online_since is not None and not self.process_loss_queued:
+                self.status = "Running"
+
+    def note_activity_problem(self, reason: str, scan_serial: Optional[int] = None) -> int:
+        with self.lock:
+            if scan_serial is not None:
+                if scan_serial <= self.last_activity_scan_serial:
+                    return self.activity_problem_checks
+                self.last_activity_scan_serial = scan_serial
+            if self.activity_problem_reason == reason:
+                self.activity_problem_checks += 1
+            else:
+                self.activity_problem_reason = reason
+                self.activity_problem_checks = 1
+            return self.activity_problem_checks
+
+    def note_activity_healthy(self, scan_serial: Optional[int] = None) -> None:
+        with self.lock:
+            if scan_serial is not None:
+                if scan_serial <= self.last_activity_scan_serial:
+                    return
+                self.last_activity_scan_serial = scan_serial
+            self.activity_problem_checks = 0
+            self.activity_problem_reason = ""
+            if self.status.startswith("Activity Unhealthy") and self.online_since is not None and not self.process_loss_queued:
                 self.status = "Running"
 
     def trigger_process_lost(self):
-        """Mark a confirmed process loss and return a new launch generation."""
+        """Latch a per-instance full relaunch and return its new generation."""
         with self.lock:
             if not self.active or self.process_loss_queued:
+                return None
+            if time.monotonic() < self.process_loss_retry_after:
                 return None
 
             self.generation += 1
             self.online_since = None
             self.status = "Process Lost"
             self.process_loss_queued = True
+            self.missing_pid_checks = 0
+            self.window_missing_checks = 0
+            self.activity_problem_checks = 0
+            self.activity_problem_reason = ""
             return self.generation
+
+    def finish_process_loss_failure(self, generation: int, cooldown: float = PROCESS_LOST_RETRY_COOLDOWN) -> bool:
+        """Release the relaunch latch after failed attempts and arm a cooldown."""
+        with self.lock:
+            if not self.active or self.generation != generation:
+                return False
+            self.process_loss_queued = False
+            self.online_since = None
+            self.status = "Recovery Failed"
+            self.missing_pid_checks = 0
+            self.window_missing_checks = 0
+            self.activity_problem_checks = 0
+            self.activity_problem_reason = ""
+            self.process_loss_retry_after = time.monotonic() + max(0.0, cooldown)
+            return True
 
     def primary_pid(self) -> Optional[int]:
         with self.lock:
@@ -487,9 +626,13 @@ class RobloxInstance:
             if self.active:
                 self.online_since = time.monotonic()
                 self.status = "Running"
+                self.has_reached_running = True
                 self.missing_pid_checks = 0
                 self.window_missing_checks = 0
+                self.activity_problem_checks = 0
+                self.activity_problem_reason = ""
                 self.process_loss_queued = False
+                self.process_loss_retry_after = 0.0
 
     def clear_uptime(self) -> None:
         with self.lock:
@@ -550,10 +693,102 @@ class RobloxManager:
         self._last_window_scan = 0.0
         self._last_window_scan_success = False
         self._window_packages_cache: set[str] = set()
+        self._window_scan_serial = 0
+        self._window_scan_in_progress = False
+        self._last_activity_scan = 0.0
+        self._last_activity_scan_success = False
+        self._activity_problems_cache: Dict[str, str] = {}
+        self._activity_scan_serial = 0
+        self._activity_scan_in_progress = False
 
     def instances_snapshot(self) -> List[RobloxInstance]:
         with self.lock:
             return list(self.instances.values())
+
+    def _window_scan_worker(self, packages: List[str], session_id: int) -> None:
+        try:
+            result = self.shell.window_packages(packages)
+        except Exception:
+            result = None
+        with self.lock:
+            self._window_scan_in_progress = False
+            if session_id != self.startup_run_id:
+                # A session was replaced while dumpsys was running. Discard its
+                # result so an old window set cannot affect the new selection.
+                self._last_window_scan = 0.0
+                return
+            if result is None:
+                self._last_window_scan_success = False
+            else:
+                self._window_packages_cache = set(result)
+                self._last_window_scan_success = True
+                self._window_scan_serial += 1
+
+    def _activity_scan_worker(self, packages: List[str], session_id: int) -> None:
+        try:
+            result = self.shell.activity_problem_packages(packages)
+        except Exception:
+            result = None
+        with self.lock:
+            self._activity_scan_in_progress = False
+            if session_id != self.startup_run_id:
+                self._last_activity_scan = 0.0
+                return
+            if result is None:
+                self._last_activity_scan_success = False
+            else:
+                self._activity_problems_cache = dict(result)
+                self._last_activity_scan_success = True
+                self._activity_scan_serial += 1
+
+    def _schedule_health_scans(self, tracked_packages: List[str], now: float) -> None:
+        if not tracked_packages:
+            return
+
+        start_window = False
+        start_activity = False
+        with self.lock:
+            session_id = self.startup_run_id
+            if (
+                not self._window_scan_in_progress
+                and now - self._last_window_scan >= WINDOW_SCAN_INTERVAL
+            ):
+                self._window_scan_in_progress = True
+                self._last_window_scan = now
+                start_window = True
+            if (
+                not self._activity_scan_in_progress
+                and now - self._last_activity_scan >= ACTIVITY_SCAN_INTERVAL
+            ):
+                self._activity_scan_in_progress = True
+                self._last_activity_scan = now
+                start_activity = True
+
+        if start_window:
+            try:
+                threading.Thread(
+                    target=self._window_scan_worker,
+                    args=(list(tracked_packages), session_id),
+                    name="window-health-scan",
+                    daemon=True,
+                ).start()
+            except Exception:
+                with self.lock:
+                    self._window_scan_in_progress = False
+                    self._last_window_scan = 0.0
+
+        if start_activity:
+            try:
+                threading.Thread(
+                    target=self._activity_scan_worker,
+                    args=(list(tracked_packages), session_id),
+                    name="activity-health-scan",
+                    daemon=True,
+                ).start()
+            except Exception:
+                with self.lock:
+                    self._activity_scan_in_progress = False
+                    self._last_activity_scan = 0.0
 
     def start_sessions(self, packages: List[str]) -> None:
         self.stop_sessions(kill=False, clear=True)
@@ -561,6 +796,16 @@ class RobloxManager:
             self.startup_run_id += 1
             startup_run_id = self.startup_run_id
             self.startup_in_progress = True
+            self._last_window_scan = 0.0
+            self._last_window_scan_success = False
+            self._window_packages_cache = set()
+            self._window_scan_serial = 0
+            # Give WindowManager its first lightweight sample immediately and
+            # stagger the heavier ActivityManager dump a few seconds later.
+            self._last_activity_scan = time.monotonic()
+            self._last_activity_scan_success = False
+            self._activity_problems_cache = {}
+            self._activity_scan_serial = 0
             for package in packages:
                 self.instances[package] = RobloxInstance(package)
 
@@ -636,10 +881,22 @@ class RobloxManager:
     def _launch_flow_entry(self, instance: RobloxInstance) -> None:
         self._launch_flow(instance, instance.current_generation())
 
-    def _launch_flow(self, instance: RobloxInstance, generation: int) -> None:
-        if not instance.is_current(generation) or self.shutdown_event.is_set():
-            return
+    def _launch_flow(self, instance: RobloxInstance, generation: int) -> bool:
+        """Run the normal full launch flow for one package only.
 
+        Returns True only after launch, lobby wait, deep-link and PID checks
+        succeed. If this is a recovery from a previously observed missing
+        window, also wait briefly for WindowManager to report that package again
+        when WindowManager inspection is supported on this device.
+        """
+        if not instance.is_current(generation) or self.shutdown_event.is_set():
+            return False
+
+        initial_state = instance.snapshot()
+        require_window_restore = bool(
+            initial_state.get("process_loss_queued")
+            and initial_state.get("window_seen")
+        )
         cfg = self.config.load()
         package = instance.package
         instance.add_event("Launching app")
@@ -650,39 +907,38 @@ class RobloxManager:
         if launch_result.code != 0:
             instance.add_event(f"Launch failed ({launch_result.code})")
             instance.set_status("Launch Failed")
-            return
+            return False
 
-        # Wait for the process to appear before entering the lobby timer.
+        # Wait for this exact package's process to appear before starting the
+        # lobby timer. This works both for a genuinely dead app and a still-live
+        # app whose launcher/activity needs to be brought back.
         pid_deadline = time.monotonic() + 12.0
         pids: List[int] = []
         while time.monotonic() < pid_deadline:
             if not instance.is_current(generation) or self.shutdown_event.is_set():
-                return
+                return False
             pids = self.shell.pidof(package)
             instance.update_pids(pids)
             if pids:
                 break
             self.shutdown_event.wait(0.5)
 
-        if not instance.is_current(generation):
-            return
+        if not instance.is_current(generation) or self.shutdown_event.is_set():
+            return False
 
-        # Never let a launch flow advance to the lobby/deep-link stage while
-        # the target process is still missing. This keeps PID/state consistent
-        # and prevents a false "Running" state after a failed relaunch.
         if not pids:
             instance.add_event("Launch failed: PID did not appear")
             instance.set_status("Launch Failed")
-            return
+            return False
 
         delay = int(cfg.get("lobby_delay", DEFAULT_CONFIG["lobby_delay"]))
         instance.add_event(f"Lobby wait {delay}s")
         instance.set_status(f"Lobby {delay}s")
         if not self._wait_with_generation(instance, generation, float(delay), "Lobby"):
-            return
+            return False
 
         if not instance.is_current(generation) or self.shutdown_event.is_set():
-            return
+            return False
 
         instance.add_event(f"Joining Place {cfg['place_id']}")
         instance.set_status("Joining")
@@ -691,16 +947,16 @@ class RobloxManager:
         if join_result.code != 0:
             instance.add_event(f"Deep link failed ({join_result.code})")
             instance.set_status("Join Failed")
-            return
+            return False
 
-        # Verify that the target process still exists after the join intent
-        # before declaring the instance online. This is especially important
-        # for Process Lost full-relaunch recovery.
+        # Confirm the target package still has a process after the intent. A
+        # successful `am start` only means Android accepted the command; it is
+        # not proof that Roblox remained alive.
         verify_deadline = time.monotonic() + 8.0
         pids = []
         while time.monotonic() < verify_deadline:
             if not instance.is_current(generation) or self.shutdown_event.is_set():
-                return
+                return False
             pids = self.shell.pidof(package)
             instance.update_pids(pids)
             if pids:
@@ -708,16 +964,118 @@ class RobloxManager:
             self.shutdown_event.wait(0.5)
 
         if not instance.is_current(generation) or self.shutdown_event.is_set():
-            return
+            return False
 
         if not pids:
             instance.add_event("Join failed: PID verification timeout")
             instance.set_status("Join Failed")
-            return
+            return False
+
+        # If this recovery was triggered because a window previously visible
+        # for this package disappeared, verify that it returns. Unknown parser
+        # output disables this one check rather than falsely declaring failure.
+        if require_window_restore:
+            window_deadline = time.monotonic() + WINDOW_RESTORE_TIMEOUT
+            window_confirmed = False
+            reliable_window_sample = False
+            while time.monotonic() < window_deadline:
+                if not instance.is_current(generation) or self.shutdown_event.is_set():
+                    return False
+                try:
+                    observed = self.shell.window_packages([package])
+                except Exception:
+                    observed = None
+                if observed is None:
+                    instance.add_event("Window verification unavailable; PID verified")
+                    break
+                reliable_window_sample = True
+                if package in observed:
+                    window_confirmed = True
+                    break
+                self.shutdown_event.wait(1.0)
+
+            if reliable_window_sample and not window_confirmed:
+                instance.add_event("Recovery incomplete: package window did not return")
+                instance.set_status("Window Restore Failed")
+                return False
+
+        if not instance.is_current(generation) or self.shutdown_event.is_set():
+            return False
 
         instance.set_online()
-        instance.add_event("Session online")
+        instance.add_event("Session online; launch flow verified")
+        return True
 
+    def _start_full_relaunch(
+        self,
+        instance: RobloxInstance,
+        reason: str,
+        generation: Optional[int] = None,
+    ) -> bool:
+        """Start one de-duplicated full launch flow for a single instance."""
+        if generation is None:
+            generation = instance.trigger_process_lost()
+        elif not instance.is_current(generation):
+            return False
+        if generation is None:
+            return False
+
+        instance.add_event(f"{reason}; full relaunch generation {generation}")
+        try:
+            thread = threading.Thread(
+                target=self._full_relaunch_worker,
+                args=(instance, generation, reason),
+                name=f"full-relaunch-{instance.package}",
+                daemon=True,
+            )
+            thread.start()
+            return True
+        except Exception as exc:
+            instance.add_event(f"Could not start recovery thread: {exc}")
+            instance.finish_process_loss_failure(generation)
+            return False
+
+    def _full_relaunch_worker(
+        self,
+        instance: RobloxInstance,
+        generation: int,
+        reason: str,
+    ) -> None:
+        """Retry a full relaunch a bounded number of times without touching siblings."""
+        for attempt in range(1, FULL_RELAUNCH_MAX_ATTEMPTS + 1):
+            if self.shutdown_event.is_set() or not instance.is_current(generation):
+                return
+
+            instance.add_event(
+                f"Full relaunch attempt {attempt}/{FULL_RELAUNCH_MAX_ATTEMPTS}: {reason}"
+            )
+            try:
+                succeeded = self._launch_flow(instance, generation)
+            except Exception as exc:
+                succeeded = False
+                instance.add_event(f"Relaunch exception: {type(exc).__name__}: {exc}")
+                instance.set_status("Launch Failed")
+
+            if succeeded:
+                # _launch_flow -> set_online() releases the in-flight latch.
+                return
+            if self.shutdown_event.is_set() or not instance.is_current(generation):
+                return
+
+            if attempt < FULL_RELAUNCH_MAX_ATTEMPTS:
+                wait_seconds = FULL_RELAUNCH_RETRY_BASE * attempt
+                instance.add_event(f"Relaunch retry in {int(wait_seconds)}s")
+                instance.set_status(f"Retry {attempt + 1}/{FULL_RELAUNCH_MAX_ATTEMPTS}")
+                deadline = time.monotonic() + wait_seconds
+                while time.monotonic() < deadline:
+                    if self.shutdown_event.is_set() or not instance.is_current(generation):
+                        return
+                    self.shutdown_event.wait(min(0.25, deadline - time.monotonic()))
+
+        if instance.finish_process_loss_failure(generation):
+            instance.add_event(
+                f"Full relaunch failed after {FULL_RELAUNCH_MAX_ATTEMPTS} attempts; watchdog retry armed"
+            )
     def _wait_with_generation(
         self,
         instance: RobloxInstance,
@@ -828,16 +1186,30 @@ class RobloxManager:
             finally:
                 instance.recovery_queue.task_done()
 
+    def _package_named_in_log(self, raw_line: str) -> Optional[str]:
+        """Resolve an exact selected package name embedded in a system crash line."""
+        with self.lock:
+            packages = [pkg for pkg, instance in self.instances.items() if instance.snapshot()["active"]]
+        matches = [
+            package for package in packages
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(package)}(?![A-Za-z0-9_])", raw_line)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def handle_sensor_event(self, pid: int, reason: str, raw_line: str) -> None:
-        # During the initial multi-instance boot, Android/Zetsu can emit noisy
-        # logcat lines while CPU/RAM usage is peaking. Do not let those lines
-        # invalidate a normal launch flow. The detector itself remains running
-        # and resumes as soon as the final startup stabilization completes.
+        # Keep the initial startup shield, but don't let logcat from an unrelated
+        # process invalidate an in-flight per-package full relaunch.
         with self.lock:
             if self.startup_in_progress:
                 return
 
         package = self.resolve_pid(pid)
+        if not package and reason.startswith("Crash:"):
+            # ActivityManager/lmkd often logs the *system* PID while embedding
+            # the actual app package in its message (for example, "Process
+            # com.roblox.clienu ... has died"). Resolve only an unambiguous
+            # exact package name from strong crash-pattern lines.
+            package = self._package_named_in_log(raw_line)
         if not package:
             return
 
@@ -846,7 +1218,19 @@ class RobloxManager:
         if not instance:
             return
 
-        message = raw_line.strip()
+        snap = instance.snapshot()
+        if not snap["active"] or snap["process_loss_queued"]:
+            return
+
+        # Crash/ANR/OOM signatures use full launch recovery, not the in-game
+        # deep-link-only queue. PID ownership or an exact package mention in a
+        # strong system crash line must be established first.
+        if reason.startswith("Crash:"):
+            if not snap["has_reached_running"]:
+                return
+            self._start_full_relaunch(instance, f"Crash/ANR signal: {reason}")
+            return
+
         if instance.can_queue_recovery(pid, reason):
             instance.add_event(f"Sensor: {reason}")
 
@@ -878,6 +1262,7 @@ class RobloxManager:
         return None
 
     def refresh_pids(self) -> None:
+        """Poll PIDs promptly and consume asynchronously sampled UI/process health."""
         new_map: Dict[int, str] = {}
         now = time.monotonic()
 
@@ -890,115 +1275,138 @@ class RobloxManager:
             for instance in instances
             if instance.snapshot()["active"]
         ]
-
-        # WindowManager is considerably more expensive than pidof(). Cache the
-        # result briefly so the watchdog does not hammer dumpsys every second on
-        # a low-spec Android device. A failed scan is treated as "unknown", not
-        # as "all windows missing".
-        window_packages: Optional[set[str]] = None
-        if tracked_packages:
-            try:
-                with self.lock:
-                    should_scan_windows = (
-                        now - getattr(self, "_last_window_scan", 0.0)
-                        >= WINDOW_SCAN_INTERVAL
-                    )
-                    cached_windows = set(getattr(self, "_window_packages_cache", set()))
-                    last_scan_success = getattr(self, "_last_window_scan_success", False)
-
-                if should_scan_windows:
-                    scanned = self.shell.window_packages(tracked_packages)
-                    with self.lock:
-                        self._last_window_scan = now
-                        if scanned is not None:
-                            self._window_packages_cache = set(scanned)
-                            self._last_window_scan_success = True
-                        else:
-                            self._last_window_scan_success = False
-                            cached_windows = set()
-                        window_packages = (
-                            set(scanned) if scanned is not None
-                            else None
-                        )
-                else:
-                    window_packages = cached_windows if last_scan_success else None
-            except Exception:
-                window_packages = None
+        # Never block the one-second PID watchdog on expensive `dumpsys` calls.
+        # WindowManager and ActivityManager scans run in separate daemon threads.
+        self._schedule_health_scans(tracked_packages, now)
+        with self.lock:
+            window_packages: Optional[set[str]] = (
+                set(self._window_packages_cache)
+                if self._last_window_scan_success else None
+            )
+            window_scan_serial = self._window_scan_serial
+            activity_problems: Optional[Dict[str, str]] = (
+                dict(self._activity_problems_cache)
+                if self._last_activity_scan_success else None
+            )
+            activity_scan_serial = self._activity_scan_serial
 
         for instance in instances:
             snap = instance.snapshot()
             if not snap["active"]:
                 continue
 
+            # If an earlier full relaunch exhausted its bounded retries, arm a
+            # fresh attempt after its cooldown. This is per-instance and cannot
+            # restart a healthy sibling.
+            if (
+                snap["status"] == "Recovery Failed"
+                and not snap["process_loss_queued"]
+                and now >= instance.process_loss_retry_after
+            ):
+                self._start_full_relaunch(instance, "Watchdog retry after recovery failure")
+                snap = instance.snapshot()
+
+            package = instance.package
             try:
-                pids = self.shell.pidof(instance.package)
+                pids = self.shell.pidof(package)
             except Exception:
+                # A command error is indistinguishable from no PID at this
+                # call site, but three checks plus prior Running state protects
+                # against one transient failure.
                 pids = []
 
             if not pids:
-                # PID-loss recovery has priority over window-loss recovery.
-                # A dead process is always a full relaunch case.
-                has_been_online = snap["online_since"] is not None
-                if startup_in_progress and not has_been_online:
+                # Keep the displayed PID honest even while the recovery latch is
+                # set. update_pids([]) does not release that latch.
+                instance.update_pids([])
+                # Only instances that previously reached Running are eligible.
+                # A global staggered startup must not shield an already-online
+                # sibling from crash recovery.
+                has_been_online = snap["has_reached_running"]
+                if not has_been_online:
                     instance.update_pids([])
-                elif has_been_online:
+                elif not snap["process_loss_queued"]:
                     missing_count = instance.note_pid_missing()
                     if missing_count < PID_MISSING_CONFIRMATIONS:
                         instance.set_status(
                             f"PID Missing {missing_count}/{PID_MISSING_CONFIRMATIONS}"
                         )
                     else:
-                        generation = instance.trigger_process_lost()
-                        if generation is not None:
-                            instance.add_event(
-                                f"Process Lost: PID missing {PID_MISSING_CONFIRMATIONS} checks; relaunching"
-                            )
-                            threading.Thread(
-                                target=self._launch_flow,
-                                args=(instance, generation),
-                                name=f"process-lost-{instance.package}",
-                                daemon=True,
-                            ).start()
+                        self._start_full_relaunch(
+                            instance,
+                            f"Process Lost: PID missing {PID_MISSING_CONFIRMATIONS} consecutive checks",
+                        )
             else:
                 instance.update_pids(pids)
+                if window_packages is not None and package in window_packages:
+                    # Learn whether this package is represented by WindowManager
+                    # at all before using absence as a watchdog signal.
+                    instance.note_window_present(window_scan_serial)
+                current = instance.snapshot()
 
-                # Window watchdog: only monitor instances that have actually
-                # reached Running state. Give every newly-online instance its
-                # normal stabilization window before declaring a missing UI.
-                has_been_online = snap["online_since"] is not None
+                # Explicit ActivityManager notResponding/crashing flags are a
+                # second signal. Require two fresh positive dumps to avoid
+                # reacting to stale or momentary activity-state transitions.
+                if (
+                    activity_problems is not None
+                    and activity_scan_serial > 0
+                    and current["has_reached_running"]
+                    and not current["process_loss_queued"]
+                ):
+                    activity_reason = activity_problems.get(package)
+                    if activity_reason:
+                        problem_count = instance.note_activity_problem(
+                            activity_reason, activity_scan_serial
+                        )
+                        if problem_count < ACTIVITY_PROBLEM_CONFIRMATIONS:
+                            instance.set_status(
+                                f"Activity Unhealthy {problem_count}/{ACTIVITY_PROBLEM_CONFIRMATIONS}"
+                            )
+                        else:
+                            started = self._start_full_relaunch(
+                                instance,
+                                f"ActivityManager unhealthy: {activity_reason}",
+                            )
+                            if started:
+                                current = instance.snapshot()
+                    else:
+                        instance.note_activity_healthy(activity_scan_serial)
+
+                current = instance.snapshot()
+                has_been_online = current["has_reached_running"]
+                in_full_relaunch = current["process_loss_queued"]
+                online_since = current["online_since"]
+                stabilization_complete = (
+                    online_since is None
+                    or now - online_since >= STARTUP_STABILIZATION_DELAY
+                )
                 window_watch_armed = (
                     has_been_online
-                    and (
-                        not startup_in_progress
-                        or now - snap["online_since"] >= STARTUP_STABILIZATION_DELAY
-                    )
+                    and current["window_seen"]
+                    and not in_full_relaunch
+                    and (not startup_in_progress or stabilization_complete)
                     and window_packages is not None
                 )
 
                 if window_watch_armed:
-                    if instance.package in window_packages:
-                        instance.note_window_present()
+                    if package in window_packages:
+                        # Presence from cached output is safe to use to clear a
+                        # streak; absence only counts on a fresh successful scan.
+                        instance.note_window_present(window_scan_serial)
                     else:
-                        missing_count = instance.note_window_missing()
+                        missing_count = instance.note_window_missing(window_scan_serial)
                         if missing_count < WINDOW_MISSING_CONFIRMATIONS:
                             instance.set_status(
                                 f"Window Missing {missing_count}/{WINDOW_MISSING_CONFIRMATIONS}"
                             )
                         else:
-                            generation = instance.trigger_process_lost()
-                            if generation is not None:
-                                instance.add_event(
-                                    f"Window Lost: missing {WINDOW_MISSING_CONFIRMATIONS} checks; full relaunch"
-                                )
-                                threading.Thread(
-                                    target=self._launch_flow,
-                                    args=(instance, generation),
-                                    name=f"window-lost-{instance.package}",
-                                    daemon=True,
-                                ).start()
+                            self._start_full_relaunch(
+                                instance,
+                                f"Window Lost: absent from {WINDOW_MISSING_CONFIRMATIONS} fresh WindowManager scans",
+                            )
 
             for pid in pids:
-                new_map[pid] = instance.package
+                new_map[pid] = package
 
         with self.pid_map_lock:
             self.pid_map = new_map
@@ -1122,22 +1530,18 @@ class LogcatSensor(threading.Thread):
         if CONNECTION_FAILED_279_RE.search(text):
             return "Connection Failed 279"
 
-        # Ignore HTTP/status-style 403/524 values. These are often ordinary
-        # network diagnostics rather than an actual Roblox client error.
-        error_match = ROBLOX_ERROR_RE.search(text)
-        if error_match:
-            code = error_match.group(1)
-            if code in {"403", "524"} and HTTP_OR_STATUS_RE.search(text):
-                return None
-
-            # A matching number is only a candidate when nearby text explicitly
-            # indicates Roblox/error/disconnect semantics. This prevents values
-            # such as packet sizes, HTTP counters, IDs, or unrelated integers
-            # from becoming recovery triggers.
-            context = ROBLOX_ERROR_CONTEXT_RE.search(text)
-            if context is None:
-                return None
-
+        # Find codes only when their local text context explicitly describes a
+        # Roblox/error/disconnect condition. Iterate contextual matches instead
+        # of trusting the first number in a line. If no valid code context is
+        # found, still inspect crash signatures below rather than returning early.
+        for context_match in ROBLOX_ERROR_CONTEXT_RE.finditer(text):
+            code_match = ROBLOX_ERROR_RE.search(context_match.group(0))
+            if not code_match:
+                continue
+            code = code_match.group(1)
+            context_text = context_match.group(0)
+            if code in {"403", "524"} and HTTP_OR_STATUS_RE.search(context_text):
+                continue
             if code == "277":
                 return "Disconnect 277"
             return f"Error {code}"
@@ -1152,10 +1556,16 @@ class LogcatSensor(threading.Thread):
         """Confirm noisy logcat candidates before starting package recovery.
 
         Explicit Roblox disconnect codes 267/277 are considered strong signals
-        and may trigger immediately. Other error/crash candidates require two
-        matching events from the same PID within a short window.
+        and may trigger immediately. High-confidence crash/ANR/OOM signatures
+        also pass immediately because they can appear only once before exit;
+        ordinary error candidates require two matching events from the same PID.
         """
         if reason in {"Error 267", "Disconnect 277", "Connection Failed 279"}:
+            return True
+        if reason.startswith("Crash:"):
+            # Crash signatures often occur only once immediately before the
+            # process exits, so requiring a second line can miss the recovery.
+            # The manager still validates PID/package ownership before acting.
             return True
 
         now = time.monotonic()
