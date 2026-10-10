@@ -69,20 +69,19 @@ ROBLOX_ERROR_RE = re.compile(
 # together with "Error Code: 279". Requiring both the connection wording and
 # code 279 avoids treating an unrelated standalone number as this error.
 CONNECTION_FAILED_279_RE = re.compile(
-    r"(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))"
-    r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
-    r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
-    r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))",
+    r"(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost)|koneksi\s+gagal)"
+    r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*|kode\s*eror\s*[:#= -]?\s*)?279\b"
+    r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*|kode\s*eror\s*[:#= -]?\s*)?279\b"
+    r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost)|koneksi\s+gagal)",
     re.I,
 )
 
-# A bare number in logcat is not enough. The code must also appear in a
-# Roblox/error/disconnect-related context before it becomes a candidate.
+# Bilingual context filter: require an error/Roblox/disconnect term near a
+# known Roblox code so unrelated numbers in ordinary logcat traffic are ignored.
 ROBLOX_ERROR_CONTEXT_RE = re.compile(
-    r"(?:\b(?:roblox|error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|"
-    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
+    r"(?:\b(?:roblox|error(?:\s*(?:code|id))?|eror(?:\s*(?:code|id))?|code|kode|disconnect(?:ed|ion)?|terputus|kicked|kick|keluar)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
     r"|\b(?:264|266|267|268|270|273|275|279|280|286|403|524|600)\b.{0,24}"
-    r"\b(?:roblox|error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)\b)",
+    r"\b(?:roblox|error(?:\s*(?:code|id))?|eror(?:\s*(?:code|id))?|code|kode|disconnect(?:ed|ion)?|terputus|kicked|kick|keluar)\b)",
     re.I,
 )
 
