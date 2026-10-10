@@ -65,6 +65,17 @@ ROBLOX_ERROR_RE = re.compile(
     r"\b(264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
 )
 
+# Specific Roblox popup signature shown by the user: "Connection Failed"
+# together with "Error Code: 279". Requiring both the connection wording and
+# code 279 avoids treating an unrelated standalone number as this error.
+CONNECTION_FAILED_279_RE = re.compile(
+    r"(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))"
+    r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
+    r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
+    r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))",
+    re.I,
+)
+
 # A bare number in logcat is not enough. The code must also appear in a
 # Roblox/error/disconnect-related context before it becomes a candidate.
 ROBLOX_ERROR_CONTEXT_RE = re.compile(
@@ -1107,6 +1118,11 @@ class LogcatSensor(threading.Thread):
     def _detect_reason(tag: str, message: str) -> Optional[str]:
         text = f"{tag} {message}"
 
+        # Treat the visible Roblox "Connection Failed (Error Code: 279)"
+        # signature as a strong, specific signal before generic code matching.
+        if CONNECTION_FAILED_279_RE.search(text):
+            return "Connection Failed 279"
+
         # Ignore HTTP/status-style 403/524 values. These are often ordinary
         # network diagnostics rather than an actual Roblox client error.
         error_match = ROBLOX_ERROR_RE.search(text)
@@ -1140,7 +1156,7 @@ class LogcatSensor(threading.Thread):
         and may trigger immediately. Other error/crash candidates require two
         matching events from the same PID within a short window.
         """
-        if reason in {"Error 267", "Disconnect 277"}:
+        if reason in {"Error 267", "Disconnect 277", "Connection Failed 279"}:
             return True
 
         now = time.monotonic()
