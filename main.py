@@ -57,6 +57,12 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DEFAULT_CONFIG = {
     "lobby_delay": 30,
     "place_id": "123456789",
+    "periodic_rejoin_enabled": True,
+    "periodic_rejoin_interval_hours": 4,
+    "periodic_rejoin_stagger_seconds": 45,
+    "periodic_rejoin_verify_seconds": 15,
+    "periodic_rejoin_retry_seconds": 60,
+    "periodic_rejoin_max_retries": 2,
 }
 
 # Exact PID is extracted from the logcat line. The PID must also belong to a
@@ -150,6 +156,42 @@ class ConfigManager:
                 self._atomic_write(DEFAULT_CONFIG.copy())
             return self.load()
 
+    @staticmethod
+    def _normalize(data: dict) -> dict:
+        if not isinstance(data, dict):
+            data = {}
+
+        try:
+            lobby_delay = max(0, int(data.get("lobby_delay", DEFAULT_CONFIG["lobby_delay"])))
+        except (TypeError, ValueError):
+            lobby_delay = DEFAULT_CONFIG["lobby_delay"]
+
+        place_id = str(data.get("place_id", DEFAULT_CONFIG["place_id"])).strip()
+        if not place_id.isdigit():
+            place_id = DEFAULT_CONFIG["place_id"]
+
+        enabled = data.get("periodic_rejoin_enabled", DEFAULT_CONFIG["periodic_rejoin_enabled"])
+        if not isinstance(enabled, bool):
+            enabled = DEFAULT_CONFIG["periodic_rejoin_enabled"]
+
+        def bounded_int(key: str, minimum: int, maximum: int) -> int:
+            try:
+                value = int(data.get(key, DEFAULT_CONFIG[key]))
+            except (TypeError, ValueError):
+                value = DEFAULT_CONFIG[key]
+            return max(minimum, min(maximum, value))
+
+        return {
+            "lobby_delay": lobby_delay,
+            "place_id": place_id,
+            "periodic_rejoin_enabled": enabled,
+            "periodic_rejoin_interval_hours": bounded_int("periodic_rejoin_interval_hours", 1, 168),
+            "periodic_rejoin_stagger_seconds": bounded_int("periodic_rejoin_stagger_seconds", 5, 3600),
+            "periodic_rejoin_verify_seconds": bounded_int("periodic_rejoin_verify_seconds", 5, 60),
+            "periodic_rejoin_retry_seconds": bounded_int("periodic_rejoin_retry_seconds", 10, 3600),
+            "periodic_rejoin_max_retries": bounded_int("periodic_rejoin_max_retries", 0, 5),
+        }
+
     def load(self) -> dict:
         with self.lock:
             try:
@@ -157,39 +199,39 @@ class ConfigManager:
             except (OSError, json.JSONDecodeError):
                 data = DEFAULT_CONFIG.copy()
                 self._atomic_write(data)
-
-            lobby_delay = data.get("lobby_delay", DEFAULT_CONFIG["lobby_delay"])
-            place_id = data.get("place_id", DEFAULT_CONFIG["place_id"])
-
-            try:
-                lobby_delay = max(0, int(lobby_delay))
-            except (TypeError, ValueError):
-                lobby_delay = DEFAULT_CONFIG["lobby_delay"]
-
-            place_id = str(place_id).strip()
-            if not place_id.isdigit():
-                place_id = DEFAULT_CONFIG["place_id"]
-
-            normalized = {
-                "lobby_delay": lobby_delay,
-                "place_id": place_id,
-            }
-
+            normalized = self._normalize(data)
             if normalized != data:
                 self._atomic_write(normalized)
-
             return normalized
 
-    def update(self, lobby_delay: int, place_id: str) -> dict:
-        normalized = {
-            "lobby_delay": max(0, int(lobby_delay)),
-            "place_id": str(place_id).strip(),
-        }
-        if not normalized["place_id"].isdigit():
-            raise ValueError("Place ID harus berupa angka.")
+    def update(
+        self,
+        lobby_delay: Optional[int] = None,
+        place_id: Optional[str] = None,
+        **updates,
+    ) -> dict:
+        """Update selected settings while preserving all unrelated config keys."""
+        allowed = set(DEFAULT_CONFIG) - {"lobby_delay", "place_id"}
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"Unknown config setting(s): {', '.join(sorted(unknown))}")
+
         with self.lock:
+            current = self.load()
+            if lobby_delay is not None:
+                try:
+                    current["lobby_delay"] = max(0, int(lobby_delay))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Lobby delay harus angka >= 0.") from exc
+            if place_id is not None:
+                normalized_place_id = str(place_id).strip()
+                if not normalized_place_id.isdigit():
+                    raise ValueError("Place ID harus berupa angka.")
+                current["place_id"] = normalized_place_id
+            current.update(updates)
+            normalized = self._normalize(current)
             self._atomic_write(normalized)
-        return normalized
+            return normalized
 
     def _atomic_write(self, data: dict) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -449,6 +491,9 @@ class RobloxInstance:
     def __init__(self, package: str):
         self.package = package
         self.lock = threading.RLock()
+        # Serializes start/deep-link operations for this package only. It never
+        # locks sibling clones, and scheduled rejoin must not overlap a full relaunch.
+        self.operation_lock = threading.RLock()
         self.active = True
         self.generation = 0
         self.pids: List[int] = []
@@ -471,6 +516,17 @@ class RobloxInstance:
         self.activity_problem_reason = ""
         self.process_loss_queued = False
         self.process_loss_retry_after = 0.0
+        # Scheduled-rejoin timing uses monotonic timestamps; these are runtime
+        # values and intentionally are not persisted across app restarts.
+        self.last_successful_join_at: Optional[float] = None
+        self.periodic_schedule_anchor_at: Optional[float] = None
+        self.next_periodic_rejoin_at: Optional[float] = None
+        self.periodic_interval_seconds: Optional[int] = None
+        self.periodic_schedule_enabled = False
+        self.periodic_rejoin_in_progress = False
+        self.periodic_rejoin_generation: Optional[int] = None
+        self.periodic_rejoin_attempts = 0
+        self.periodic_rejoin_retry_at: Optional[float] = None
         self.last_error_fingerprint: Optional[Tuple[int, str]] = None
         self.last_error_time = 0.0
 
@@ -498,6 +554,11 @@ class RobloxInstance:
                 "missing_pid_checks": self.missing_pid_checks,
                 "window_missing_checks": self.window_missing_checks,
                 "activity_problem_checks": self.activity_problem_checks,
+                "last_successful_join_at": self.last_successful_join_at,
+                "next_periodic_rejoin_at": self.next_periodic_rejoin_at,
+                "periodic_rejoin_in_progress": self.periodic_rejoin_in_progress,
+                "periodic_rejoin_attempts": self.periodic_rejoin_attempts,
+                "periodic_rejoin_retry_at": self.periodic_rejoin_retry_at,
             }
 
     def update_pids(self, pids: List[int]) -> None:
@@ -621,18 +682,182 @@ class RobloxInstance:
             if self.active:
                 self.status = status
 
-    def set_online(self) -> None:
+    def set_online(
+        self,
+        periodic_interval_seconds: Optional[int] = None,
+        periodic_enabled: bool = False,
+    ) -> None:
+        """Mark a successful join and anchor the next scheduled rejoin."""
+        now = time.monotonic()
         with self.lock:
-            if self.active:
-                self.online_since = time.monotonic()
+            if not self.active:
+                return
+            self.online_since = now
+            self.status = "Running"
+            self.has_reached_running = True
+            self.missing_pid_checks = 0
+            self.window_missing_checks = 0
+            self.activity_problem_checks = 0
+            self.activity_problem_reason = ""
+            self.process_loss_queued = False
+            self.process_loss_retry_after = 0.0
+
+            self.last_successful_join_at = now
+            self.periodic_schedule_anchor_at = now
+            self.periodic_schedule_enabled = bool(periodic_enabled and periodic_interval_seconds)
+            self.periodic_interval_seconds = (
+                max(1, int(periodic_interval_seconds))
+                if self.periodic_schedule_enabled else None
+            )
+            self.next_periodic_rejoin_at = (
+                now + self.periodic_interval_seconds
+                if self.periodic_schedule_enabled and self.periodic_interval_seconds is not None
+                else None
+            )
+            self.periodic_rejoin_in_progress = False
+            self.periodic_rejoin_generation = None
+            self.periodic_rejoin_attempts = 0
+            self.periodic_rejoin_retry_at = None
+
+    def sync_periodic_schedule(
+        self,
+        enabled: bool,
+        interval_seconds: int,
+        now: Optional[float] = None,
+    ) -> None:
+        """Apply live config changes without resetting a successful-join clock."""
+        if now is None:
+            now = time.monotonic()
+        interval_seconds = max(1, int(interval_seconds))
+        with self.lock:
+            if not self.active or self.periodic_rejoin_in_progress:
+                return
+
+            if not enabled:
+                self.periodic_schedule_enabled = False
+                self.periodic_interval_seconds = interval_seconds
+                self.next_periodic_rejoin_at = None
+                self.periodic_rejoin_retry_at = None
+                self.periodic_rejoin_attempts = 0
+                return
+
+            if self.last_successful_join_at is None:
+                # Instances that have not joined successfully yet get their
+                # first timer from the eventual set_online() call.
+                return
+
+            if not self.periodic_schedule_enabled:
+                # Re-enabling the feature starts a fresh full interval instead
+                # of surprising the user with an immediate catch-up rejoin.
+                self.periodic_schedule_enabled = True
+                self.periodic_interval_seconds = interval_seconds
+                self.periodic_schedule_anchor_at = now
+                self.next_periodic_rejoin_at = now + interval_seconds
+                self.periodic_rejoin_attempts = 0
+                self.periodic_rejoin_retry_at = None
+                return
+
+            if self.periodic_interval_seconds != interval_seconds:
+                self.periodic_interval_seconds = interval_seconds
+                anchor = self.periodic_schedule_anchor_at or self.last_successful_join_at
+                self.next_periodic_rejoin_at = anchor + interval_seconds
+
+    def begin_periodic_rejoin(self, now: Optional[float] = None) -> Optional[int]:
+        """Atomically claim a due scheduled rejoin for this package."""
+        if now is None:
+            now = time.monotonic()
+        with self.lock:
+            if not self.active or not self.has_reached_running:
+                return None
+            if self.online_since is None or not self.pids:
+                return None
+            if self.process_loss_queued or self.periodic_rejoin_in_progress:
+                return None
+            if not self.periodic_schedule_enabled or self.next_periodic_rejoin_at is None:
+                return None
+            if now < self.next_periodic_rejoin_at:
+                return None
+            if self.periodic_rejoin_retry_at is not None and now < self.periodic_rejoin_retry_at:
+                return None
+            if self.status != "Running" and not self.status.startswith("Scheduled Retry"):
+                return None
+            if not self.recovery_queue.empty():
+                return None
+
+            self.periodic_rejoin_in_progress = True
+            self.periodic_rejoin_generation = self.generation
+            self.periodic_rejoin_attempts += 1
+            self.periodic_rejoin_retry_at = None
+            self.status = "Scheduled Rejoin"
+            return self.generation
+
+    def finish_periodic_rejoin(
+        self,
+        generation: int,
+        success: bool,
+        periodic_enabled: bool,
+        interval_seconds: int,
+        retry_seconds: int,
+        max_retries: int,
+        error: str = "",
+    ) -> bool:
+        """Finish an attempt; stale attempts cannot overwrite emergency recovery."""
+        now = time.monotonic()
+        interval_seconds = max(1, int(interval_seconds))
+        retry_seconds = max(1, int(retry_seconds))
+        max_retries = max(0, int(max_retries))
+        with self.lock:
+            # Always release this attempt's in-flight flag, even when a higher
+            # priority watchdog changed generation while an intent was pending.
+            if self.periodic_rejoin_generation == generation:
+                self.periodic_rejoin_in_progress = False
+                self.periodic_rejoin_generation = None
+
+            if not self.active or self.generation != generation or self.process_loss_queued:
+                return False
+
+            if not periodic_enabled:
+                self.periodic_schedule_enabled = False
+                self.periodic_interval_seconds = interval_seconds
+                self.next_periodic_rejoin_at = None
+                self.periodic_rejoin_retry_at = None
+                self.periodic_rejoin_attempts = 0
+                self.status = "Running" if self.online_since is not None else "Periodic Rejoin Paused"
+                return False
+
+            self.periodic_schedule_enabled = True
+            self.periodic_interval_seconds = interval_seconds
+
+            if success:
+                self.online_since = now
                 self.status = "Running"
                 self.has_reached_running = True
                 self.missing_pid_checks = 0
                 self.window_missing_checks = 0
                 self.activity_problem_checks = 0
                 self.activity_problem_reason = ""
-                self.process_loss_queued = False
                 self.process_loss_retry_after = 0.0
+                self.last_successful_join_at = now
+                self.periodic_schedule_anchor_at = now
+                self.next_periodic_rejoin_at = now + interval_seconds
+                self.periodic_rejoin_attempts = 0
+                self.periodic_rejoin_retry_at = None
+                return True
+
+            if self.periodic_rejoin_attempts <= max_retries:
+                self.periodic_rejoin_retry_at = now + retry_seconds
+                self.status = f"Scheduled Retry {self.periodic_rejoin_attempts}/{max_retries}"
+                return False
+
+            # Retry budget exhausted. Keep the last-success timestamp truthful,
+            # but anchor the next normal scheduled attempt in the future to avoid
+            # hammering a device that is already under load.
+            self.periodic_rejoin_attempts = 0
+            self.periodic_rejoin_retry_at = None
+            self.periodic_schedule_anchor_at = now
+            self.next_periodic_rejoin_at = now + interval_seconds
+            self.status = "Running" if self.online_since is not None else "Periodic Rejoin Failed"
+            return False
 
     def clear_uptime(self) -> None:
         with self.lock:
@@ -881,7 +1106,29 @@ class RobloxManager:
     def _launch_flow_entry(self, instance: RobloxInstance) -> None:
         self._launch_flow(instance, instance.current_generation())
 
+    def _periodic_rejoin_settings(self, cfg: Optional[dict] = None) -> Tuple[bool, int]:
+        if cfg is None:
+            cfg = self.config.load()
+        enabled = bool(cfg.get("periodic_rejoin_enabled", False))
+        interval_seconds = max(1, int(cfg.get("periodic_rejoin_interval_hours", 4))) * 3600
+        return enabled, interval_seconds
+
+    def _mark_instance_online(self, instance: RobloxInstance) -> None:
+        cfg = self.config.load()
+        enabled, interval_seconds = self._periodic_rejoin_settings(cfg)
+        instance.set_online(
+            periodic_interval_seconds=interval_seconds if enabled else None,
+            periodic_enabled=enabled,
+        )
+
     def _launch_flow(self, instance: RobloxInstance, generation: int) -> bool:
+        """Serialize full launch flows per package without blocking sibling clones."""
+        with instance.operation_lock:
+            if not instance.is_current(generation) or self.shutdown_event.is_set():
+                return False
+            return self._launch_flow_impl(instance, generation)
+
+    def _launch_flow_impl(self, instance: RobloxInstance, generation: int) -> bool:
         """Run the normal full launch flow for one package only.
 
         Returns True only after launch, lobby wait, deep-link and PID checks
@@ -1002,7 +1249,7 @@ class RobloxManager:
         if not instance.is_current(generation) or self.shutdown_event.is_set():
             return False
 
-        instance.set_online()
+        self._mark_instance_online(instance)
         instance.add_event("Session online; launch flow verified")
         return True
 
@@ -1149,10 +1396,16 @@ class RobloxManager:
                 # Recovery bypasses the normal launch flow.
                 # Keep the Roblox process alive and send only the deep-link
                 # intent to the target package.
-                join_result = self.shell.open_deep_link(
-                    instance.package,
-                    cfg["place_id"],
-                )
+                with instance.operation_lock:
+                    if (
+                        not instance.is_current(generation)
+                        or self.shutdown_event.is_set()
+                    ):
+                        return
+                    join_result = self.shell.open_deep_link(
+                        instance.package,
+                        cfg["place_id"],
+                    )
 
                 if join_result.code != 0:
                     instance.add_event(
@@ -1167,7 +1420,7 @@ class RobloxManager:
                 ):
                     return
 
-                instance.set_online()
+                self._mark_instance_online(instance)
                 instance.add_event("Rejoin successful")
 
                 # Preserve the existing queued-recovery handling.
@@ -1443,6 +1696,162 @@ class PidMonitor(threading.Thread):
             except Exception:
                 pass
             self.stop_event.wait(1.0)
+
+
+class ScheduledRejoinWorker(threading.Thread):
+    """Rejoin healthy Roblox instances periodically without killing processes.
+
+    One worker serializes scheduled rejoin requests globally. Full relaunch and
+    Logcat recovery retain priority, and each intent is scoped to one package.
+    """
+
+    def __init__(self, manager: RobloxManager, stop_event: threading.Event):
+        super().__init__(name="scheduled-rejoin", daemon=True)
+        self.manager = manager
+        self.stop_event = stop_event
+        self.last_dispatch_at = 0.0
+        self.cursor = 0
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                cfg = self.manager.config.load()
+                enabled, interval_seconds = self.manager._periodic_rejoin_settings(cfg)
+                now = time.monotonic()
+
+                instances = self.manager.instances_snapshot()
+                due = []
+                for instance in instances:
+                    instance.sync_periodic_schedule(enabled, interval_seconds, now)
+                    snap = instance.snapshot()
+                    due_at = snap.get("next_periodic_rejoin_at")
+                    retry_at = snap.get("periodic_rejoin_retry_at")
+                    if (
+                        snap["active"]
+                        and snap["has_reached_running"]
+                        and due_at is not None
+                        and due_at <= now
+                        and (retry_at is None or retry_at <= now)
+                        and not snap["periodic_rejoin_in_progress"]
+                        and not snap["process_loss_queued"]
+                    ):
+                        due.append((due_at, instance.package, instance))
+
+                if due:
+                    stagger = max(5, int(cfg.get("periodic_rejoin_stagger_seconds", 45)))
+                    wait_left = self.last_dispatch_at + stagger - now
+                    if self.last_dispatch_at and wait_left > 0:
+                        self.stop_event.wait(min(1.0, wait_left))
+                        continue
+
+                    due.sort(key=lambda item: (item[0], item[1]))
+                    # Rotate ties to avoid repeatedly favoring the same package
+                    # after shared retries or config changes.
+                    if len(due) > 1:
+                        offset = self.cursor % len(due)
+                        due = due[offset:] + due[:offset]
+                    claimed = False
+                    for _due_at, _package, instance in due:
+                        generation = instance.begin_periodic_rejoin(time.monotonic())
+                        if generation is None:
+                            continue
+                        self.cursor += 1
+                        self.last_dispatch_at = time.monotonic()
+                        self._perform_rejoin(instance, generation, cfg)
+                        claimed = True
+                        break
+                    if claimed:
+                        continue
+            except Exception as exc:
+                # Keep the periodic worker alive for long AFK runs, while leaving
+                # a breadcrumb rather than silently losing the scheduling loop.
+                try:
+                    for instance in self.manager.instances_snapshot():
+                        if instance.snapshot()["active"]:
+                            instance.add_event(
+                                f"Scheduled rejoin worker error: {type(exc).__name__}: {exc}"
+                            )
+                            break
+                except Exception:
+                    pass
+            self.stop_event.wait(1.0)
+
+    def _perform_rejoin(self, instance: RobloxInstance, generation: int, cfg: dict) -> None:
+        success = False
+        error = ""
+        package = instance.package
+        try:
+            if self.stop_event.is_set() or not instance.is_current(generation):
+                error = "cancelled by higher-priority recovery"
+                return
+
+            cfg = self.manager.config.load()
+            enabled, interval_seconds = self.manager._periodic_rejoin_settings(cfg)
+            if not enabled:
+                error = "scheduled rejoin disabled before dispatch"
+                return
+
+            instance.add_event(
+                f"Scheduled rejoin attempt {instance.snapshot()['periodic_rejoin_attempts']}"
+            )
+            instance.set_status("Scheduled Rejoin")
+
+            # Serialize just this instance's action against full relaunch and
+            # Logcat deep-link operations. Sibling packages are never locked.
+            with instance.operation_lock:
+                if self.stop_event.is_set() or not instance.is_current(generation):
+                    error = "cancelled before deep link"
+                    return
+                result = self.manager.shell.open_deep_link(package, cfg["place_id"])
+                if result.code != 0:
+                    error = f"deep-link command failed ({result.code})"
+                    return
+
+                verify_seconds = max(5, int(cfg.get("periodic_rejoin_verify_seconds", 15)))
+                deadline = time.monotonic() + verify_seconds
+                observed_pids: List[int] = []
+                while time.monotonic() < deadline:
+                    if self.stop_event.is_set() or not instance.is_current(generation):
+                        error = "cancelled during verification"
+                        return
+                    observed_pids = self.manager.shell.pidof(package)
+                    if observed_pids:
+                        break
+                    self.stop_event.wait(min(1.0, max(0.0, deadline - time.monotonic())))
+
+                if not observed_pids:
+                    error = f"PID not present after {verify_seconds}s verification"
+                    return
+
+                instance.update_pids(observed_pids)
+                # A live PID plus an accepted VIEW intent is the portable
+                # minimum verification. WindowManager remains the separate
+                # health watchdog; a flaky dumpsys parser must not create a
+                # false scheduled-rejoin failure loop.
+                success = True
+                instance.add_event("Scheduled deep link accepted; PID verified")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            current_cfg = self.manager.config.load()
+            enabled, interval_seconds = self.manager._periodic_rejoin_settings(current_cfg)
+            retry_seconds = max(10, int(current_cfg.get("periodic_rejoin_retry_seconds", 60)))
+            max_retries = max(0, int(current_cfg.get("periodic_rejoin_max_retries", 2)))
+            finished = instance.finish_periodic_rejoin(
+                generation=generation,
+                success=success,
+                periodic_enabled=enabled,
+                interval_seconds=interval_seconds,
+                retry_seconds=retry_seconds,
+                max_retries=max_retries,
+                error=error,
+            )
+            if success and finished:
+                instance.add_event("Scheduled rejoin completed; next interval armed")
+            elif error:
+                snap = instance.snapshot()
+                if snap["active"] and snap["generation"] == generation and not snap["process_loss_queued"]:
+                    instance.add_event(f"Scheduled rejoin failed: {error}")
 
 
 class LogcatSensor(threading.Thread):
@@ -1802,7 +2211,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Place ID: '+str(cfg['place_id'])+'  |  Lobby: '+str(cfg['lobby_delay'])+'s', inner)}|",
+            f"|{self._fit('Place ID: '+str(cfg['place_id'])+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
             f"|{self._fit(header, inner)}|",
             f"+{'-' * inner}+",
@@ -1820,7 +2229,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Place:'+str(cfg['place_id'])+'  Lobby:'+str(cfg['lobby_delay'])+'s', inner)}|",
+            f"|{self._fit('Place:'+str(cfg['place_id'])+' Lobby:'+str(cfg['lobby_delay'])+'s R:'+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
         ]
         if rows:
@@ -1908,6 +2317,7 @@ class AutoRejoinRobloxApp:
         self.manager = RobloxManager(self.shell, self.config, self.shutdown_event)
         self.pid_monitor = PidMonitor(self.manager, self.shutdown_event)
         self.logcat_sensor = LogcatSensor(self.manager, self.shutdown_event)
+        self.scheduled_rejoin_worker = ScheduledRejoinWorker(self.manager, self.shutdown_event)
         self.packages: List[str] = []
 
     def run(self) -> None:
@@ -1936,6 +2346,8 @@ class AutoRejoinRobloxApp:
             self.pid_monitor.start()
         if not self.logcat_sensor.is_alive():
             self.logcat_sensor.start()
+        if not self.scheduled_rejoin_worker.is_alive():
+            self.scheduled_rejoin_worker.start()
 
     def _box(self, lines: List[str], title: Optional[str] = None) -> None:
         """Render a compact left-aligned box that survives portrait mode."""
@@ -1961,6 +2373,7 @@ class AutoRejoinRobloxApp:
                     f"Packages terdeteksi : {len(self.packages)}",
                     f"Lobby delay        : {cfg['lobby_delay']} detik",
                     f"Place ID           : {cfg['place_id']}",
+                    f"Scheduled Rejoin   : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'} ({cfg['periodic_rejoin_interval_hours']} jam)",
                     "",
                     "[1] Mulai / Start AFK",
                     "[2] Setting",
@@ -2042,6 +2455,8 @@ class AutoRejoinRobloxApp:
                 [
                     f"1. Lobby delay : {cfg['lobby_delay']} detik",
                     f"2. Place ID    : {cfg['place_id']}",
+                    f"3. Scheduled Rejoin : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
+                    f"4. Rejoin interval  : {cfg['periodic_rejoin_interval_hours']} jam",
                     "",
                     "0. Kembali",
                 ],
@@ -2076,6 +2491,31 @@ class AutoRejoinRobloxApp:
                     self.config.update(cfg["lobby_delay"], place_id)
                     self._safe_print("Place ID disimpan.")
                 time.sleep(0.8)
+            elif choice == "3":
+                enabled = not cfg["periodic_rejoin_enabled"]
+                self.config.update(
+                    cfg["lobby_delay"],
+                    cfg["place_id"],
+                    periodic_rejoin_enabled=enabled,
+                )
+                self._safe_print(
+                    f"Scheduled Rejoin {'diaktifkan' if enabled else 'dinonaktifkan'}."
+                )
+                time.sleep(0.8)
+            elif choice == "4":
+                try:
+                    hours = int(TerminalIO.safe_line_input("Interval rejoin (1-168 jam): ").strip())
+                    if not 1 <= hours <= 168:
+                        raise ValueError
+                    self.config.update(
+                        cfg["lobby_delay"],
+                        cfg["place_id"],
+                        periodic_rejoin_interval_hours=hours,
+                    )
+                    self._safe_print(f"Interval Scheduled Rejoin disimpan: {hours} jam.")
+                except (ValueError, KeyboardInterrupt, EOFError):
+                    self._safe_print("Interval harus angka antara 1 sampai 168 jam.")
+                time.sleep(0.8)
             else:
                 self._safe_print("Pilihan tidak valid.")
                 time.sleep(0.8)
@@ -2092,7 +2532,7 @@ class AutoRejoinRobloxApp:
         except Exception:
             pass
 
-        for thread in (self.pid_monitor, self.logcat_sensor):
+        for thread in (self.pid_monitor, self.logcat_sensor, self.scheduled_rejoin_worker):
             try:
                 thread.join(timeout=3)
             except Exception:
