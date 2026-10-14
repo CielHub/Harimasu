@@ -33,6 +33,7 @@ import termios
 import threading
 import time
 import tty
+from urllib.parse import parse_qs, urlencode, urlparse
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,8 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DEFAULT_CONFIG = {
     "lobby_delay": 30,
     "place_id": "123456789",
+    "join_mode": "place_id",
+    "private_server_link": "",
     "periodic_rejoin_enabled": True,
     "periodic_rejoin_interval_hours": 4,
     "periodic_rejoin_stagger_seconds": 45,
@@ -64,6 +67,78 @@ DEFAULT_CONFIG = {
     "periodic_rejoin_retry_seconds": 60,
     "periodic_rejoin_max_retries": 2,
 }
+
+
+def private_server_deep_link(link: str) -> str:
+    """Convert a supported Roblox private-server URL into an app deep link.
+
+    Supported formats:
+    - https://www.roblox.com/share?code=...&type=Server
+    - roblox://navigation/share_links?code=...&type=Server
+    - Legacy Roblox game URLs with a privateServerLinkCode/linkCode.
+
+    Unknown formats are rejected rather than silently falling back to a public place.
+    """
+    raw = str(link or "").strip().replace("&amp;", "&")
+    if not raw or "\n" in raw or "\r" in raw:
+        raise ValueError("Link private server kosong atau tidak valid.")
+
+    parsed = urlparse(raw)
+    query = parse_qs(parsed.query, keep_blank_values=False)
+
+    def one(name: str) -> str:
+        values = query.get(name, [])
+        return values[0].strip() if values else ""
+
+    def valid_code(code: str) -> bool:
+        return bool(code and len(code) <= 512 and re.fullmatch(r"[A-Za-z0-9_-]+", code))
+
+    # Roblox app deep link for the modern share-link resolver.
+    if (
+        parsed.scheme.lower() == "roblox"
+        and parsed.netloc.lower() == "navigation"
+        and parsed.path.strip("/").lower() == "share_links"
+    ):
+        code = one("code")
+        link_type = one("type")
+        if not valid_code(code) or link_type.lower() != "server":
+            raise ValueError("Deep link Roblox harus berisi code dan type=Server.")
+        return "roblox://navigation/share_links?" + urlencode({"code": code, "type": "Server"})
+
+    # Web URLs must be HTTPS on the actual Roblox domain.
+    host = (parsed.hostname or "").lower().rstrip(".")
+    is_roblox_host = host == "roblox.com" or host.endswith(".roblox.com")
+    if parsed.scheme.lower() != "https" or not is_roblox_host:
+        raise ValueError("Gunakan link HTTPS dari domain roblox.com atau deep link Roblox yang didukung.")
+
+    path = parsed.path.rstrip("/").lower()
+    if path == "/share":
+        code = one("code")
+        link_type = one("type")
+        if not valid_code(code) or link_type.lower() != "server":
+            raise ValueError("Link share harus memuat code=... dan type=Server.")
+        return "roblox://navigation/share_links?" + urlencode({"code": code, "type": "Server"})
+
+    # Older invite links commonly look like /games/<placeId>/...?...privateServerLinkCode=...
+    match = re.match(r"^/games/(\d+)(?:/|$)", parsed.path, re.I)
+    if match:
+        place_id = match.group(1)
+        link_code = one("privateServerLinkCode") or one("linkCode")
+        access_code = one("accessCode")
+        if valid_code(link_code):
+            return "roblox://placeId=" + place_id + "&" + urlencode({"linkCode": link_code})
+        if valid_code(access_code):
+            return "roblox://placeId=" + place_id + "&" + urlencode({"accessCode": access_code})
+
+    raise ValueError("Format link private server tidak dikenali. Tempel link Server dari Roblox.")
+
+
+def join_target_label(cfg: dict) -> str:
+    """Return a display-safe target label without exposing the invite code."""
+    if cfg.get("join_mode") == "private_server_link":
+        return "Private Server Link"
+    return "Place ID " + str(cfg.get("place_id", DEFAULT_CONFIG["place_id"]))
+
 
 # Exact PID is extracted from the logcat line. The PID must also belong to a
 # currently selected package before any kill command is allowed.
@@ -170,6 +245,19 @@ class ConfigManager:
         if not place_id.isdigit():
             place_id = DEFAULT_CONFIG["place_id"]
 
+        private_server_link = str(data.get("private_server_link", "") or "").strip()
+        if private_server_link:
+            try:
+                private_server_deep_link(private_server_link)
+            except ValueError:
+                private_server_link = ""
+
+        join_mode = data.get("join_mode", DEFAULT_CONFIG["join_mode"])
+        if join_mode not in ("place_id", "private_server_link"):
+            join_mode = "place_id"
+        if join_mode == "private_server_link" and not private_server_link:
+            join_mode = "place_id"
+
         enabled = data.get("periodic_rejoin_enabled", DEFAULT_CONFIG["periodic_rejoin_enabled"])
         if not isinstance(enabled, bool):
             enabled = DEFAULT_CONFIG["periodic_rejoin_enabled"]
@@ -184,6 +272,8 @@ class ConfigManager:
         return {
             "lobby_delay": lobby_delay,
             "place_id": place_id,
+            "join_mode": join_mode,
+            "private_server_link": private_server_link,
             "periodic_rejoin_enabled": enabled,
             "periodic_rejoin_interval_hours": bounded_int("periodic_rejoin_interval_hours", 1, 168),
             "periodic_rejoin_stagger_seconds": bounded_int("periodic_rejoin_stagger_seconds", 5, 3600),
@@ -228,6 +318,16 @@ class ConfigManager:
                 if not normalized_place_id.isdigit():
                     raise ValueError("Place ID harus berupa angka.")
                 current["place_id"] = normalized_place_id
+
+            next_link = str(updates.get("private_server_link", current.get("private_server_link", "")) or "").strip()
+            next_mode = updates.get("join_mode", current.get("join_mode", "place_id"))
+            if next_link:
+                private_server_deep_link(next_link)
+            if next_mode not in ("place_id", "private_server_link"):
+                raise ValueError("Mode join tidak dikenal.")
+            if next_mode == "private_server_link" and not next_link:
+                raise ValueError("Masukkan link private server sebelum mengaktifkan mode ini.")
+
             current.update(updates)
             normalized = self._normalize(current)
             self._atomic_write(normalized)
@@ -445,8 +545,29 @@ class AndroidShell:
         return self.run_su(fallback, timeout=20)
 
     def open_deep_link(self, package: str, place_id: str) -> CommandResult:
+        """Open the existing public Place ID target (backward-compatible helper)."""
         pkg = shlex.quote(package)
         uri = shlex.quote(f"roblox://placeId={place_id}")
+        command = f"am start -a android.intent.action.VIEW -d {uri} {pkg}"
+        return self.run_su(command, timeout=20)
+
+    def open_join_target(self, package: str, cfg: dict) -> CommandResult:
+        """Open the configured Place ID or private-server invitation for one clone."""
+        mode = cfg.get("join_mode", "place_id")
+        if mode == "private_server_link":
+            try:
+                target_uri = private_server_deep_link(cfg.get("private_server_link", ""))
+            except ValueError as exc:
+                return CommandResult(2, "", str(exc))
+        else:
+            place_id = str(cfg.get("place_id", "")).strip()
+            if not place_id.isdigit():
+                return CommandResult(2, "", "Place ID tidak valid.")
+            target_uri = f"roblox://placeId={place_id}"
+
+        # Quote both arguments so URL query separators cannot be interpreted by the shell.
+        pkg = shlex.quote(package)
+        uri = shlex.quote(target_uri)
         command = f"am start -a android.intent.action.VIEW -d {uri} {pkg}"
         return self.run_su(command, timeout=20)
 
@@ -1072,7 +1193,7 @@ class RobloxManager:
 
                 # _launch_flow_entry blocks until the package has either completed
                 # its normal flow or failed. Only apply stabilization after a
-                # successful online transition, i.e. after open_deep_link ran.
+                # successful online transition, i.e. after the join target intent ran.
                 snap = instance.snapshot()
                 if snap["status"] == "Running" and snap["online_since"] is not None:
                     instance.add_event(
@@ -1187,10 +1308,10 @@ class RobloxManager:
         if not instance.is_current(generation) or self.shutdown_event.is_set():
             return False
 
-        instance.add_event(f"Joining Place {cfg['place_id']}")
+        instance.add_event(f"Joining {join_target_label(cfg)}")
         instance.set_status("Joining")
         with self.startup_semaphore:
-            join_result = self.shell.open_deep_link(package, cfg["place_id"])
+            join_result = self.shell.open_join_target(package, cfg)
         if join_result.code != 0:
             instance.add_event(f"Deep link failed ({join_result.code})")
             instance.set_status("Join Failed")
@@ -1388,9 +1509,7 @@ class RobloxManager:
 
                 cfg = self.config.load()
 
-                instance.add_event(
-                    f"Rejoining Place {cfg['place_id']}"
-                )
+                instance.add_event(f"Rejoining {join_target_label(cfg)}")
                 instance.set_status("Rejoining")
 
                 # Recovery bypasses the normal launch flow.
@@ -1402,10 +1521,7 @@ class RobloxManager:
                         or self.shutdown_event.is_set()
                     ):
                         return
-                    join_result = self.shell.open_deep_link(
-                        instance.package,
-                        cfg["place_id"],
-                    )
+                    join_result = self.shell.open_join_target(instance.package, cfg)
 
                 if join_result.code != 0:
                     instance.add_event(
@@ -1802,7 +1918,7 @@ class ScheduledRejoinWorker(threading.Thread):
                 if self.stop_event.is_set() or not instance.is_current(generation):
                     error = "cancelled before deep link"
                     return
-                result = self.manager.shell.open_deep_link(package, cfg["place_id"])
+                result = self.manager.shell.open_join_target(package, cfg)
                 if result.code != 0:
                     error = f"deep-link command failed ({result.code})"
                     return
@@ -2211,7 +2327,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Place ID: '+str(cfg['place_id'])+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
+            f"|{self._fit('Join: '+join_target_label(cfg)+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
             f"|{self._fit(header, inner)}|",
             f"+{'-' * inner}+",
@@ -2229,7 +2345,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Place:'+str(cfg['place_id'])+' Lobby:'+str(cfg['lobby_delay'])+'s R:'+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
+            f"|{self._fit('Join:'+('Private' if cfg.get('join_mode') == 'private_server_link' else str(cfg['place_id']))+' Lobby:'+str(cfg['lobby_delay'])+'s R:'+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
         ]
         if rows:
@@ -2372,7 +2488,7 @@ class AutoRejoinRobloxApp:
                 [
                     f"Packages terdeteksi : {len(self.packages)}",
                     f"Lobby delay        : {cfg['lobby_delay']} detik",
-                    f"Place ID           : {cfg['place_id']}",
+                    f"Join Target        : {join_target_label(cfg)}",
                     f"Scheduled Rejoin   : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'} ({cfg['periodic_rejoin_interval_hours']} jam)",
                     "",
                     "[1] Mulai / Start AFK",
@@ -2450,13 +2566,16 @@ class AutoRejoinRobloxApp:
     def _settings_menu(self) -> None:
         while not self.shutdown_event.is_set():
             cfg = self.config.load()
+            mode_label = "Private Server Link" if cfg["join_mode"] == "private_server_link" else "Place ID"
             TerminalIO.clear()
             self._box(
                 [
                     f"1. Lobby delay : {cfg['lobby_delay']} detik",
                     f"2. Place ID    : {cfg['place_id']}",
-                    f"3. Scheduled Rejoin : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
-                    f"4. Rejoin interval  : {cfg['periodic_rejoin_interval_hours']} jam",
+                    f"3. Join mode   : {mode_label}",
+                    "4. Set private server link",
+                    f"5. Scheduled Rejoin : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
+                    f"6. Rejoin interval  : {cfg['periodic_rejoin_interval_hours']} jam",
                     "",
                     "0. Kembali",
                 ],
@@ -2492,6 +2611,53 @@ class AutoRejoinRobloxApp:
                     self._safe_print("Place ID disimpan.")
                 time.sleep(0.8)
             elif choice == "3":
+                if cfg["join_mode"] == "private_server_link":
+                    self.config.update(
+                        cfg["lobby_delay"], cfg["place_id"], join_mode="place_id"
+                    )
+                    self._safe_print("Mode join diubah ke Place ID.")
+                    time.sleep(0.8)
+                    continue
+
+                link = cfg.get("private_server_link", "")
+                if not link:
+                    try:
+                        link = TerminalIO.safe_line_input(
+                            "Tempel link private server Roblox: "
+                        ).strip()
+                    except (KeyboardInterrupt, EOFError):
+                        return
+                try:
+                    private_server_deep_link(link)
+                    self.config.update(
+                        cfg["lobby_delay"],
+                        cfg["place_id"],
+                        join_mode="private_server_link",
+                        private_server_link=link,
+                    )
+                    self._safe_print("Mode Private Server Link diaktifkan.")
+                except ValueError as exc:
+                    self._safe_print(str(exc))
+                time.sleep(1.2)
+            elif choice == "4":
+                try:
+                    link = TerminalIO.safe_line_input(
+                        "Tempel link private server Roblox: "
+                    ).strip()
+                    private_server_deep_link(link)
+                    self.config.update(
+                        cfg["lobby_delay"],
+                        cfg["place_id"],
+                        join_mode="private_server_link",
+                        private_server_link=link,
+                    )
+                    self._safe_print("Link disimpan. Mode Private Server Link aktif.")
+                except ValueError as exc:
+                    self._safe_print(str(exc))
+                except (KeyboardInterrupt, EOFError):
+                    return
+                time.sleep(1.2)
+            elif choice == "5":
                 enabled = not cfg["periodic_rejoin_enabled"]
                 self.config.update(
                     cfg["lobby_delay"],
@@ -2502,7 +2668,7 @@ class AutoRejoinRobloxApp:
                     f"Scheduled Rejoin {'diaktifkan' if enabled else 'dinonaktifkan'}."
                 )
                 time.sleep(0.8)
-            elif choice == "4":
+            elif choice == "6":
                 try:
                     hours = int(TerminalIO.safe_line_input("Interval rejoin (1-168 jam): ").strip())
                     if not 1 <= hours <= 168:
