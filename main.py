@@ -67,7 +67,10 @@ DEFAULT_CONFIG = {
     "periodic_rejoin_enabled": True,
     "periodic_rejoin_interval_hours": 4,
     "periodic_rejoin_stagger_seconds": 45,
-    "periodic_rejoin_verify_seconds": 15,
+    # Periodic full restart uses a longer health-verification window than a
+    # simple PID check. This is not RAM monitoring; it verifies process/window
+    # stability and detects explicit join errors.
+    "periodic_rejoin_verify_seconds": 45,
     "periodic_rejoin_retry_seconds": 60,
     "periodic_rejoin_max_retries": 2,
 }
@@ -164,6 +167,24 @@ CONNECTION_FAILED_279_RE = re.compile(
     r".{0,100}\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
     r"|\b(?:error\s*(?:code|id)\s*[:#= -]?\s*)?279\b"
     r".{0,100}(?:connection\s+(?:failed|failure|lost)|connection(?:failed|failure|lost))",
+    re.I,
+)
+
+# Positive markers seen in Roblox client logs when the client actually joins a
+# server. When the package's internal log directory is readable, periodic restart
+# verification requires one of these markers after the new join intent, rather
+# than treating a live PID or home-screen window as proof of a successful join.
+ROBLOX_JOIN_SUCCESS_RE = re.compile(
+    r"(?:Connection accepted from|"
+    r"DataModelLoadingPhase::OnAfterLoadingComplete|"
+    r"joinGamePostStandard finished)",
+    re.I,
+)
+ROBLOX_JOIN_FAILURE_RE = re.compile(
+    r"(?:connection\s+(?:failed|failure|lost)|failed\s+to\s+connect|"
+    r"failed\s+to\s+join|joinGamePostStandard\s+failed|"
+    r"teleport(?:ation)?\s+(?:failed|failure)|"
+    r"error\s*(?:code|id)\s*[:#= -]?\s*(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600))",
     re.I,
 )
 
@@ -281,7 +302,7 @@ class ConfigManager:
             "periodic_rejoin_enabled": enabled,
             "periodic_rejoin_interval_hours": bounded_int("periodic_rejoin_interval_hours", 1, 168),
             "periodic_rejoin_stagger_seconds": bounded_int("periodic_rejoin_stagger_seconds", 5, 3600),
-            "periodic_rejoin_verify_seconds": bounded_int("periodic_rejoin_verify_seconds", 5, 60),
+            "periodic_rejoin_verify_seconds": bounded_int("periodic_rejoin_verify_seconds", 15, 120),
             "periodic_rejoin_retry_seconds": bounded_int("periodic_rejoin_retry_seconds", 10, 3600),
             "periodic_rejoin_max_retries": bounded_int("periodic_rejoin_max_retries", 0, 5),
         }
@@ -428,6 +449,69 @@ class AndroidShell:
             return ""
         raw = result.stdout.replace("\x00", "").strip()
         return raw.splitlines()[0].strip() if raw else ""
+
+    def roblox_log_snapshot(self, package: str) -> Optional[dict]:
+        """Return the newest package-local Roblox log path and byte length.
+
+        On rooted Android, common locations are /data/user/0/<package>/files/
+        appData/logs and /data/data/<package>/files/appData/logs. A missing or
+        inaccessible directory returns None so the caller can use the weaker
+        PID/window health fallback instead of failing every clone immediately.
+        """
+        command = (
+            f"pkg={shlex.quote(package)}; latest=\"\"; "
+            'for dir in "/data/user/0/$pkg/files/appData/logs" '
+            '"/data/data/$pkg/files/appData/logs"; do '
+            '[ -d "$dir" ] || continue; '
+            'candidate=$(ls -t "$dir"/*.log 2>/dev/null | head -n 1); '
+            '[ -n "$candidate" ] || continue; '
+            'if [ -z "$latest" ] || [ "$candidate" -nt "$latest" ]; then latest="$candidate"; fi; '
+            'done; [ -n "$latest" ] || exit 3; '
+            'size=$(wc -c < "$latest" 2>/dev/null) || exit 4; '
+            'printf "%s\\t%s\\n" "$size" "$latest"'
+        )
+        result = self.run_su(command, timeout=8)
+        if result.code != 0 or not result.stdout.strip():
+            return None
+        try:
+            size_text, path = result.stdout.strip().split("\t", 1)
+            size = int(size_text.strip())
+            path = path.strip()
+            if size < 0 or not path.startswith("/data/"):
+                return None
+            return {"path": path, "size": size}
+        except (ValueError, TypeError):
+            return None
+
+    def read_roblox_log_delta(
+        self,
+        package: str,
+        previous: Optional[dict],
+    ) -> Tuple[Optional[dict], str]:
+        """Read only new Roblox client log bytes since a saved snapshot."""
+        current = self.roblox_log_snapshot(package)
+        if current is None:
+            return previous, ""
+
+        path = str(current["path"])
+        if previous and previous.get("path") == path:
+            try:
+                old_size = max(0, int(previous.get("size", 0)))
+            except (TypeError, ValueError):
+                old_size = 0
+            if current["size"] >= old_size:
+                if current["size"] == old_size:
+                    return current, ""
+                command = f"tail -c +{old_size + 1} {shlex.quote(path)}"
+            else:
+                # The same log was truncated or rotated in place.
+                command = f"tail -c 262144 {shlex.quote(path)}"
+        else:
+            # A fresh file appeared after restart or the log rotated.
+            command = f"tail -c 262144 {shlex.quote(path)}"
+
+        result = self.run_su(command, timeout=8)
+        return current, result.stdout if result.code == 0 else ""
 
     def window_packages(self, tracked_packages: Optional[List[str]] = None) -> Optional[set[str]]:
         """Return tracked packages with a visible WindowManager surface.
@@ -628,6 +712,7 @@ class RobloxInstance:
         self.events: Deque[str] = deque(maxlen=8)
         self.recovery_queue: queue.Queue[Tuple[int, str]] = queue.Queue(maxsize=1)
         self.recovery_thread: Optional[threading.Thread] = None
+        self.recovery_processing = False
         self.recovery_last_pid: Optional[int] = None
         self.last_known_pid: Optional[int] = None
         self.last_known_pid_at = 0.0
@@ -652,6 +737,13 @@ class RobloxInstance:
         self.periodic_rejoin_generation: Optional[int] = None
         self.periodic_rejoin_attempts = 0
         self.periodic_rejoin_retry_at: Optional[float] = None
+        self.periodic_restart_phase = ""
+        # Sensor errors seen during a periodic full-restart are recorded instead
+        # of spawning an overlapping recovery worker. The restart verifier checks
+        # this serial to reject a join attempt that emitted an explicit error.
+        self.join_error_serial = 0
+        self.join_error_reason = ""
+        self.periodic_join_error_serial_start = 0
         self.last_error_fingerprint: Optional[Tuple[int, str]] = None
         self.last_error_time = 0.0
 
@@ -676,6 +768,7 @@ class RobloxInstance:
                 "has_reached_running": self.has_reached_running,
                 "window_seen": self.window_seen,
                 "process_loss_queued": self.process_loss_queued,
+                "recovery_processing": self.recovery_processing,
                 "missing_pid_checks": self.missing_pid_checks,
                 "window_missing_checks": self.window_missing_checks,
                 "activity_problem_checks": self.activity_problem_checks,
@@ -684,6 +777,10 @@ class RobloxInstance:
                 "periodic_rejoin_in_progress": self.periodic_rejoin_in_progress,
                 "periodic_rejoin_attempts": self.periodic_rejoin_attempts,
                 "periodic_rejoin_retry_at": self.periodic_rejoin_retry_at,
+                "join_error_serial": self.join_error_serial,
+                "join_error_reason": self.join_error_reason,
+                "periodic_join_error_serial_start": self.periodic_join_error_serial_start,
+                "periodic_restart_phase": self.periodic_restart_phase,
             }
 
     def update_pids(self, pids: List[int]) -> None:
@@ -811,6 +908,7 @@ class RobloxInstance:
         self,
         periodic_interval_seconds: Optional[int] = None,
         periodic_enabled: bool = False,
+        preserve_periodic_restart: bool = False,
     ) -> None:
         """Mark a successful join and anchor the next scheduled rejoin."""
         now = time.monotonic()
@@ -839,10 +937,28 @@ class RobloxInstance:
                 if self.periodic_schedule_enabled and self.periodic_interval_seconds is not None
                 else None
             )
-            self.periodic_rejoin_in_progress = False
-            self.periodic_rejoin_generation = None
-            self.periodic_rejoin_attempts = 0
-            self.periodic_rejoin_retry_at = None
+            if not preserve_periodic_restart:
+                self.periodic_rejoin_in_progress = False
+                self.periodic_rejoin_generation = None
+                self.periodic_rejoin_attempts = 0
+                self.periodic_rejoin_retry_at = None
+
+    def note_periodic_join_error(self, reason: str) -> int:
+        """Record a known join/error signal without launching overlapping recovery."""
+        with self.lock:
+            self.join_error_serial += 1
+            self.join_error_reason = str(reason or "join error")[:180]
+            return self.join_error_serial
+
+    def set_periodic_restart_phase(self, phase: str, *, reset_error_baseline: bool = False) -> None:
+        with self.lock:
+            self.periodic_restart_phase = str(phase or "")[:40]
+            if reset_error_baseline:
+                self.periodic_join_error_serial_start = self.join_error_serial
+
+    def set_recovery_processing(self, processing: bool) -> None:
+        with self.lock:
+            self.recovery_processing = bool(processing)
 
     def sync_periodic_schedule(
         self,
@@ -888,21 +1004,24 @@ class RobloxInstance:
                 self.next_periodic_rejoin_at = anchor + interval_seconds
 
     def begin_periodic_rejoin(self, now: Optional[float] = None) -> Optional[int]:
-        """Atomically claim a due scheduled rejoin for this package."""
+        """Atomically claim a due scheduled full restart for this package."""
         if now is None:
             now = time.monotonic()
         with self.lock:
             if not self.active or not self.has_reached_running:
                 return None
-            if self.online_since is None or not self.pids:
-                return None
             if self.process_loss_queued or self.periodic_rejoin_in_progress:
+                return None
+            if self.recovery_processing:
                 return None
             if not self.periodic_schedule_enabled or self.next_periodic_rejoin_at is None:
                 return None
             if now < self.next_periodic_rejoin_at:
                 return None
             if self.periodic_rejoin_retry_at is not None and now < self.periodic_rejoin_retry_at:
+                return None
+            is_retry = self.status.startswith("Scheduled Retry") and self.periodic_rejoin_retry_at is not None
+            if not is_retry and (self.online_since is None or not self.pids):
                 return None
             if self.status != "Running" and not self.status.startswith("Scheduled Retry"):
                 return None
@@ -913,7 +1032,10 @@ class RobloxInstance:
             self.periodic_rejoin_generation = self.generation
             self.periodic_rejoin_attempts += 1
             self.periodic_rejoin_retry_at = None
-            self.status = "Scheduled Rejoin"
+            self.periodic_join_error_serial_start = self.join_error_serial
+            self.periodic_restart_phase = "stopping"
+            self.online_since = None
+            self.status = "Scheduled Full Restart"
             return self.generation
 
     def finish_periodic_rejoin(
@@ -937,6 +1059,7 @@ class RobloxInstance:
             if self.periodic_rejoin_generation == generation:
                 self.periodic_rejoin_in_progress = False
                 self.periodic_rejoin_generation = None
+                self.periodic_restart_phase = ""
 
             if not self.active or self.generation != generation or self.process_loss_queued:
                 return False
@@ -947,7 +1070,17 @@ class RobloxInstance:
                 self.next_periodic_rejoin_at = None
                 self.periodic_rejoin_retry_at = None
                 self.periodic_rejoin_attempts = 0
-                self.status = "Running" if self.online_since is not None else "Periodic Rejoin Paused"
+                if success:
+                    # The user may turn the schedule off while a restart is
+                    # already completing. Keep the successfully joined game
+                    # online, but do not arm another periodic restart.
+                    self.online_since = now
+                    self.status = "Running"
+                    self.has_reached_running = True
+                    self.last_successful_join_at = now
+                    self.periodic_schedule_anchor_at = now
+                else:
+                    self.status = "Running" if self.online_since is not None else "Periodic Full Restart Paused"
                 return False
 
             self.periodic_schedule_enabled = True
@@ -974,14 +1107,13 @@ class RobloxInstance:
                 self.status = f"Scheduled Retry {self.periodic_rejoin_attempts}/{max_retries}"
                 return False
 
-            # Retry budget exhausted. Keep the last-success timestamp truthful,
-            # but anchor the next normal scheduled attempt in the future to avoid
-            # hammering a device that is already under load.
+            # Retry budget exhausted. Keep the instance marked offline and
+            # retry after a longer cooldown rather than waiting a whole interval
+            # (e.g. four hours) while the app is stopped.
             self.periodic_rejoin_attempts = 0
-            self.periodic_rejoin_retry_at = None
-            self.periodic_schedule_anchor_at = now
-            self.next_periodic_rejoin_at = now + interval_seconds
-            self.status = "Running" if self.online_since is not None else "Periodic Rejoin Failed"
+            self.periodic_rejoin_retry_at = now + max(retry_seconds, 300)
+            self.next_periodic_rejoin_at = now
+            self.status = "Scheduled Retry Delayed"
             return False
 
     def clear_uptime(self) -> None:
@@ -1034,6 +1166,9 @@ class RobloxManager:
         self.pid_map: Dict[int, str] = {}
         self.pid_map_lock = threading.RLock()
         self.startup_semaphore = threading.Semaphore(STARTUP_CONCURRENCY)
+        # Serializes the entire launch/restart lifecycle, not just the individual
+        # `am start` command. RAM checks are intentionally not part of this lock.
+        self.launch_coordinator_lock = threading.RLock()
         # True while the selected clones are going through the initial
         # sequential boot + lobby + map + stabilization sequence. During this
         # window Logcat errors are treated as startup noise and must not cancel
@@ -1242,20 +1377,152 @@ class RobloxManager:
         interval_seconds = max(1, int(cfg.get("periodic_rejoin_interval_hours", 4))) * 3600
         return enabled, interval_seconds
 
-    def _mark_instance_online(self, instance: RobloxInstance) -> None:
+    def _mark_instance_online(
+        self,
+        instance: RobloxInstance,
+        *,
+        preserve_periodic_restart: bool = False,
+    ) -> None:
         cfg = self.config.load()
         enabled, interval_seconds = self._periodic_rejoin_settings(cfg)
         instance.set_online(
             periodic_interval_seconds=interval_seconds if enabled else None,
             periodic_enabled=enabled,
+            preserve_periodic_restart=preserve_periodic_restart,
         )
 
-    def _launch_flow(self, instance: RobloxInstance, generation: int) -> bool:
-        """Serialize full launch flows per package without blocking sibling clones."""
-        with instance.operation_lock:
-            if not instance.is_current(generation) or self.shutdown_event.is_set():
-                return False
-            return self._launch_flow_impl(instance, generation)
+    def _launch_flow(
+        self,
+        instance: RobloxInstance,
+        generation: int,
+        *,
+        require_join_health: bool = False,
+        preserve_periodic_restart: bool = False,
+    ) -> bool:
+        """Run one complete launch lifecycle under the global coordinator.
+
+        The global lock is deliberately held for the full launch flow so several
+        clone recoveries cannot all start heavy Roblox sessions in parallel.
+        It does not inspect or gate on RAM.
+        """
+        with self.launch_coordinator_lock:
+            with instance.operation_lock:
+                if not instance.is_current(generation) or self.shutdown_event.is_set():
+                    return False
+                return self._launch_flow_impl(
+                    instance,
+                    generation,
+                    require_join_health=require_join_health,
+                    preserve_periodic_restart=preserve_periodic_restart,
+                )
+
+    def _verify_periodic_join_health(
+        self,
+        instance: RobloxInstance,
+        generation: int,
+        timeout_seconds: int,
+        baseline_log_snapshot: Optional[dict] = None,
+    ) -> Tuple[bool, str]:
+        """Require stable PID/window observations and no explicit join errors.
+
+        Android/Roblox does not expose one universal API proving the game world
+        has loaded for every clone. This health check is intentionally a proxy:
+        it requires a live PID, a reliably parsed visible package window across
+        three samples, no ActivityManager crash/ANR flag, and no join-error event
+        received since the periodic restart began. If the package-local client
+        log is readable, a fresh positive server-join marker is also mandatory.
+        """
+        package = instance.package
+        snap = instance.snapshot()
+        baseline_error_serial = int(snap.get("periodic_join_error_serial_start", 0))
+        timeout_seconds = max(15, min(120, int(timeout_seconds)))
+        deadline = time.monotonic() + timeout_seconds
+        consecutive_visible = 0
+        window_parser_seen = False
+        log_source_available = baseline_log_snapshot is not None
+        current_log_snapshot = baseline_log_snapshot
+        success_marker_seen = False
+        last_reason = "visible game window not confirmed"
+        read_delta = getattr(self.shell, "read_roblox_log_delta", None)
+
+        while time.monotonic() < deadline:
+            if self.shutdown_event.is_set() or not instance.is_current(generation):
+                return False, "join verification cancelled by shutdown or newer recovery"
+
+            snap = instance.snapshot()
+            if int(snap.get("join_error_serial", 0)) > baseline_error_serial:
+                reason = snap.get("join_error_reason") or "join error detected in logcat"
+                return False, f"join error signal: {reason}"
+
+            if callable(read_delta):
+                try:
+                    new_snapshot, log_delta = read_delta(package, current_log_snapshot)
+                except Exception:
+                    new_snapshot, log_delta = current_log_snapshot, ""
+                if new_snapshot is not None:
+                    current_log_snapshot = new_snapshot
+                    log_source_available = True
+                if log_delta:
+                    if ROBLOX_JOIN_FAILURE_RE.search(log_delta):
+                        return False, "Roblox client log contains a join/connection failure marker"
+                    if ROBLOX_JOIN_SUCCESS_RE.search(log_delta):
+                        success_marker_seen = True
+
+            try:
+                pids = self.shell.pidof(package)
+            except Exception as exc:
+                pids = []
+                last_reason = f"PID check failed: {type(exc).__name__}"
+
+            if not pids:
+                consecutive_visible = 0
+                last_reason = "package PID disappeared during join verification"
+                self.shutdown_event.wait(2.0)
+                continue
+            instance.update_pids(pids)
+
+            try:
+                activity_problems = self.shell.activity_problem_packages([package])
+            except Exception:
+                activity_problems = None
+            if activity_problems and package in activity_problems:
+                return False, f"ActivityManager reports {activity_problems[package]}"
+
+            try:
+                visible_packages = self.shell.window_packages([package])
+            except Exception:
+                visible_packages = None
+
+            if visible_packages is None:
+                consecutive_visible = 0
+                last_reason = "WindowManager output could not be parsed reliably"
+            else:
+                window_parser_seen = True
+                if package in visible_packages:
+                    consecutive_visible += 1
+                    last_reason = "waiting for three consecutive visible-window samples"
+                    if consecutive_visible >= 3 and (success_marker_seen or not log_source_available):
+                        # A final health check avoids declaring success if an
+                        # error arrived immediately after the third sample.
+                        latest = instance.snapshot()
+                        if int(latest.get("join_error_serial", 0)) > baseline_error_serial:
+                            return False, f"join error signal: {latest.get('join_error_reason', '')}"
+                        if success_marker_seen:
+                            return True, "fresh Roblox client join marker + stable PID/window + no explicit join/ANR error"
+                        return True, "client log unavailable; stable PID/window fallback passed, but game-server join marker could not be checked"
+                    elif consecutive_visible >= 3 and log_source_available and not success_marker_seen:
+                        last_reason = "visible window is stable, waiting for a fresh Roblox client game-join marker"
+                else:
+                    consecutive_visible = 0
+                    last_reason = "package process exists but its window is not visible"
+
+            self.shutdown_event.wait(min(5.0, max(0.0, deadline - time.monotonic())))
+
+        if log_source_available and not success_marker_seen:
+            return False, f"join remains unconfirmed after {timeout_seconds}s: no fresh positive Roblox client join marker ({last_reason})"
+        if not window_parser_seen:
+            return False, f"join remains unconfirmed: {last_reason}; WindowManager inspection unavailable"
+        return False, f"join remains unconfirmed after {timeout_seconds}s: {last_reason}"
 
     def _open_join_target_with_retries(
         self,
@@ -1272,7 +1539,8 @@ class RobloxManager:
         None means the attempt was superseded by a newer generation or shutdown;
         a CommandResult means the attempt budget was completed or a command was
         accepted. The per-package operation lock prevents concurrent join intents
-        for one clone, while siblings remain independent.
+        for one clone, while siblings remain serialized by the launch coordinator
+        when a full launch/restart lifecycle is active.
         """
         max_attempts = max(1, int(max_attempts))
         retry_delay = max(0.0, float(retry_delay))
@@ -1311,7 +1579,14 @@ class RobloxManager:
 
         return last_result
 
-    def _launch_flow_impl(self, instance: RobloxInstance, generation: int) -> bool:
+    def _launch_flow_impl(
+        self,
+        instance: RobloxInstance,
+        generation: int,
+        *,
+        require_join_health: bool = False,
+        preserve_periodic_restart: bool = False,
+    ) -> bool:
         """Run the normal full launch flow for one package only.
 
         Returns True only after launch, lobby wait, deep-link and PID checks
@@ -1372,6 +1647,16 @@ class RobloxManager:
 
         instance.add_event(f"Joining {join_target_label(cfg)}")
         instance.set_status("Joining")
+        join_log_snapshot = None
+        if require_join_health:
+            snapshot_fn = getattr(self.shell, "roblox_log_snapshot", None)
+            if callable(snapshot_fn):
+                try:
+                    # Capture file length before the join intent so only new
+                    # log lines from this attempt can confirm a fresh server join.
+                    join_log_snapshot = snapshot_fn(package)
+                except Exception:
+                    join_log_snapshot = None
         join_result = self._open_join_target_with_retries(
             instance,
             generation,
@@ -1411,6 +1696,24 @@ class RobloxManager:
             instance.set_status("Join Failed")
             return False
 
+        if require_join_health:
+            verify_seconds = int(cfg.get("periodic_rejoin_verify_seconds", 45))
+            instance.add_event(
+                f"Verifying join health for up to {verify_seconds}s (PID/window/error signals)"
+            )
+            instance.set_status("Verifying Join")
+            verified, detail = self._verify_periodic_join_health(
+                instance,
+                generation,
+                timeout_seconds=verify_seconds,
+                baseline_log_snapshot=join_log_snapshot,
+            )
+            if not verified:
+                instance.add_event(f"Join health verification failed: {detail}")
+                instance.set_status("Join Unconfirmed")
+                return False
+            instance.add_event(f"Join health check passed: {detail}")
+
         # If this recovery was triggered because a window previously visible
         # for this package disappeared, verify that it returns. Unknown parser
         # output disables this one check rather than falsely declaring failure.
@@ -1442,8 +1745,15 @@ class RobloxManager:
         if not instance.is_current(generation) or self.shutdown_event.is_set():
             return False
 
-        self._mark_instance_online(instance)
-        instance.add_event("Session online; launch flow verified")
+        if preserve_periodic_restart:
+            # Scheduled full restart does not become Running yet. Its caller
+            # must also finish the 20-second post-join stability period; only
+            # finish_periodic_rejoin() then resets the four-hour timer.
+            instance.set_status("Join Health Verified")
+            instance.add_event("Join health verified; post-join stabilization pending")
+        else:
+            self._mark_instance_online(instance)
+            instance.add_event("Session online; launch flow verified")
         return True
 
     def _start_full_relaunch(
@@ -1558,6 +1868,8 @@ class RobloxManager:
                 if not instance.snapshot()["active"]:
                     continue
 
+                instance.set_recovery_processing(True)
+
                 instance.recovery_last_pid = pid
                 instance.clear_uptime()
                 instance.set_status("Rejoining")
@@ -1645,6 +1957,7 @@ class RobloxManager:
                 if not self.shutdown_event.is_set():
                     self.shutdown_event.wait(1.0)
             finally:
+                instance.set_recovery_processing(False)
                 instance.recovery_queue.task_done()
 
     def _package_named_in_log(self, raw_line: str) -> Optional[str]:
@@ -1682,6 +1995,22 @@ class RobloxManager:
         snap = instance.snapshot()
         if not snap["active"] or snap["process_loss_queued"]:
             return
+
+        # During a periodic full restart, let that one coordinator own the join
+        # attempt. Non-fatal/game-join signals are recorded for its verifier
+        # instead of launching a competing deep-link recovery thread. Actual
+        # process crashes still preempt the operation via the normal relaunch
+        # path below.
+        if snap.get("periodic_rejoin_in_progress"):
+            if snap.get("periodic_restart_phase") == "stopping":
+                # Android may log the expected process death caused by our own
+                # package-scoped force-stop. Do not interpret it as a new crash.
+                instance.add_event(f"Ignored sensor during intentional stop phase: {reason}")
+                return
+            if not reason.startswith("Crash:"):
+                instance.note_periodic_join_error(reason)
+                instance.add_event(f"Join/error signal during periodic restart: {reason}")
+                return
 
         # Crash/ANR/OOM signatures use full launch recovery, not the in-game
         # deep-link-only queue. PID ownership or an exact package mention in a
@@ -1754,6 +2083,20 @@ class RobloxManager:
         for instance in instances:
             snap = instance.snapshot()
             if not snap["active"]:
+                continue
+
+            # The periodic full-restart coordinator owns this package from the
+            # package-scoped force-stop through join verification and its
+            # 20-second stabilization delay. Keep PID bookkeeping fresh, but
+            # don't let WindowManager polling create a second overlapping relaunch.
+            if snap.get("periodic_rejoin_in_progress"):
+                try:
+                    active_pids = self.shell.pidof(instance.package)
+                except Exception:
+                    active_pids = []
+                instance.update_pids(active_pids)
+                for pid in active_pids:
+                    new_map[pid] = instance.package
                 continue
 
             # If an earlier full relaunch exhausted its bounded retries, arm a
@@ -1907,10 +2250,12 @@ class PidMonitor(threading.Thread):
 
 
 class ScheduledRejoinWorker(threading.Thread):
-    """Rejoin healthy Roblox instances periodically without killing processes.
+    """Periodically full-restart each selected Roblox package, serially.
 
-    One worker serializes scheduled rejoin requests globally. Full relaunch and
-    Logcat recovery retain priority, and each intent is scoped to one package.
+    One worker schedules jobs; RobloxManager.launch_coordinator_lock serializes
+    every complete launch lifecycle. Each force-stop is package-scoped and the
+    next clone is not started until join health checks and 20-second stabilization
+    complete. No RAM thresholds are used.
     """
 
     def __init__(self, manager: RobloxManager, stop_event: threading.Event):
@@ -1977,7 +2322,7 @@ class ScheduledRejoinWorker(threading.Thread):
                     for instance in self.manager.instances_snapshot():
                         if instance.snapshot()["active"]:
                             instance.add_event(
-                                f"Scheduled rejoin worker error: {type(exc).__name__}: {exc}"
+                                f"Periodic full-restart worker error: {type(exc).__name__}: {exc}"
                             )
                             break
                 except Exception:
@@ -1985,6 +2330,17 @@ class ScheduledRejoinWorker(threading.Thread):
             self.stop_event.wait(1.0)
 
     def _perform_rejoin(self, instance: RobloxInstance, generation: int, cfg: dict) -> None:
+        """Hold the launch coordinator until restart bookkeeping is finalized."""
+        with self.manager.launch_coordinator_lock:
+            self._perform_rejoin_locked(instance, generation, cfg)
+
+    def _perform_rejoin_locked(self, instance: RobloxInstance, generation: int, cfg: dict) -> None:
+        """Run one package-scoped periodic FULL restart and verify it before advancing.
+
+        The coordinator lock spans force-stop, relaunch, lobby delay, deep link,
+        join-health verification and the post-join 20-second stability window. RAM
+        is intentionally not inspected here, per user request.
+        """
         success = False
         error = ""
         package = instance.package
@@ -1996,50 +2352,107 @@ class ScheduledRejoinWorker(threading.Thread):
             cfg = self.manager.config.load()
             enabled, interval_seconds = self.manager._periodic_rejoin_settings(cfg)
             if not enabled:
-                error = "scheduled rejoin disabled before dispatch"
+                error = "periodic full restart disabled before dispatch"
                 return
 
-            instance.add_event(
-                f"Scheduled rejoin attempt {instance.snapshot()['periodic_rejoin_attempts']}"
-            )
-            instance.set_status("Scheduled Rejoin")
+            attempt = instance.snapshot()["periodic_rejoin_attempts"]
+            instance.add_event(f"Periodic FULL restart attempt {attempt}")
+            instance.set_status("Periodic Full Restart")
 
-            # Serialize just this instance's action against full relaunch and
-            # Logcat deep-link operations. Sibling packages are never locked.
-            with instance.operation_lock:
+            # Hold the global coordinator for the entire operation. RLock allows
+            # _launch_flow() to acquire it again in the same thread.
+            with self.manager.launch_coordinator_lock:
                 if self.stop_event.is_set() or not instance.is_current(generation):
-                    error = "cancelled before deep link"
-                    return
-                result = self.manager.shell.open_join_target(package, cfg)
-                if result.code != 0:
-                    error = f"deep-link command failed ({result.code})"
+                    error = "cancelled before package stop"
                     return
 
-                verify_seconds = max(5, int(cfg.get("periodic_rejoin_verify_seconds", 15)))
-                deadline = time.monotonic() + verify_seconds
-                observed_pids: List[int] = []
-                while time.monotonic() < deadline:
-                    if self.stop_event.is_set() or not instance.is_current(generation):
-                        error = "cancelled during verification"
+                # Stop only this selected package. If it exited by itself between
+                # the PID sample and force-stop, an empty PID set is already safe.
+                with instance.operation_lock:
+                    current_pids = self.manager.shell.pidof(package)
+                    if current_pids:
+                        target_pid = current_pids[0]
+                        stopped = self.manager.shell.kill_exact_pid(target_pid, package)
+                        if not stopped:
+                            current_pids = self.manager.shell.pidof(package)
+                            if current_pids:
+                                error = "package-scoped force-stop failed; refusing to start over it"
+                                return
+
+                    stop_deadline = time.monotonic() + 10.0
+                    while time.monotonic() < stop_deadline:
+                        if self.stop_event.is_set() or not instance.is_current(generation):
+                            error = "cancelled while waiting for package to stop"
+                            return
+                        remaining_pids = self.manager.shell.pidof(package)
+                        if not remaining_pids:
+                            break
+                        instance.update_pids(remaining_pids)
+                        self.stop_event.wait(0.5)
+                    else:
+                        error = "package PID remained after force-stop timeout"
                         return
-                    observed_pids = self.manager.shell.pidof(package)
-                    if observed_pids:
-                        break
-                    self.stop_event.wait(min(1.0, max(0.0, deadline - time.monotonic())))
 
-                if not observed_pids:
-                    error = f"PID not present after {verify_seconds}s verification"
+                    instance.update_pids([])
+                    instance.add_event("Stopped target package only; starting fresh process")
+                    instance.set_status("Starting fresh process")
+                    # Drain expected process-exit logs before treating subsequent
+                    # errors as evidence that the new game join failed.
+                    self.stop_event.wait(1.0)
+                    instance.set_periodic_restart_phase(
+                        "launching", reset_error_baseline=True
+                    )
+
+                # Full launch flow: launch app -> configurable lobby delay -> deep
+                # link retries -> PID check -> visible-window/ActivityManager/error
+                # verification. No sibling package is started in parallel.
+                launched = self.manager._launch_flow(
+                    instance,
+                    generation,
+                    require_join_health=True,
+                    preserve_periodic_restart=True,
+                )
+                if not launched:
+                    latest = instance.snapshot()
+                    error = latest.get("last_event") or latest.get("status") or "full restart launch flow failed"
                     return
 
-                instance.update_pids(observed_pids)
-                # A live PID plus an accepted VIEW intent is the portable
-                # minimum verification. WindowManager remains the separate
-                # health watchdog; a flaky dumpsys parser must not create a
-                # false scheduled-rejoin failure loop.
+                # Keep this package's slot until the post-join stability period is
+                # complete. An explicit join error during this time fails the cycle.
+                instance.set_periodic_restart_phase("stabilizing")
+                instance.add_event(
+                    f"Join health passed; waiting {int(STARTUP_STABILIZATION_DELAY)}s before next package"
+                )
+                instance.set_status(f"Post-join {int(STARTUP_STABILIZATION_DELAY)}s")
+                stabilization_deadline = time.monotonic() + STARTUP_STABILIZATION_DELAY
+                error_serial_start = instance.snapshot().get("periodic_join_error_serial_start", 0)
+                while time.monotonic() < stabilization_deadline:
+                    if self.stop_event.is_set() or not instance.is_current(generation):
+                        error = "post-join stabilization cancelled by shutdown or newer recovery"
+                        return
+                    snap = instance.snapshot()
+                    if snap.get("join_error_serial", 0) > error_serial_start:
+                        error = f"join/error signal during stabilization: {snap.get('join_error_reason', '')}"
+                        instance.set_status("Join Unconfirmed")
+                        return
+                    remaining = max(0.0, stabilization_deadline - time.monotonic())
+                    seconds_left = int(remaining + 0.999)
+                    instance.set_status(f"Post-join {seconds_left}s")
+                    self.stop_event.wait(min(0.25, remaining))
+
+                # finish_periodic_rejoin() marks Running and starts the new
+                # four-hour timer only after join verification + stabilization.
+                final = instance.snapshot()
+                if final.get("join_error_serial", 0) > error_serial_start:
+                    error = f"join/error signal before completion: {final.get('join_error_reason', '')}"
+                    instance.set_status("Join Unconfirmed")
+                    return
                 success = True
-                instance.add_event("Scheduled deep link accepted; PID verified")
+                instance.add_event("Periodic full restart verified; next interval starts now")
+
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            instance.add_event(f"Periodic full restart exception: {error}")
         finally:
             current_cfg = self.manager.config.load()
             enabled, interval_seconds = self.manager._periodic_rejoin_settings(current_cfg)
@@ -2055,11 +2468,11 @@ class ScheduledRejoinWorker(threading.Thread):
                 error=error,
             )
             if success and finished:
-                instance.add_event("Scheduled rejoin completed; next interval armed")
+                instance.add_event("Periodic full restart completed; four-hour timer re-armed")
             elif error:
                 snap = instance.snapshot()
                 if snap["active"] and snap["generation"] == generation and not snap["process_loss_queued"]:
-                    instance.add_event(f"Scheduled rejoin failed: {error}")
+                    instance.add_event(f"Periodic full restart failed: {error}")
 
 
 class LogcatSensor(threading.Thread):
@@ -2419,7 +2832,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Join: '+join_target_label(cfg)+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
+                    f"|{self._fit('Join: '+join_target_label(cfg)+' | Lobby: '+str(cfg['lobby_delay'])+'s | Full restart: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
             f"|{self._fit(header, inner)}|",
             f"+{'-' * inner}+",
@@ -2437,7 +2850,7 @@ class Dashboard:
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Join:'+('Private' if cfg.get('join_mode') == 'private_server_link' else str(cfg['place_id']))+' Lobby:'+str(cfg['lobby_delay'])+'s R:'+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
+                    f"|{self._fit('Join:'+('Private' if cfg.get('join_mode') == 'private_server_link' else str(cfg['place_id']))+' Lobby:'+str(cfg['lobby_delay'])+'s FR:'+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
             f"+{'-' * inner}+",
         ]
         if rows:
@@ -2581,7 +2994,7 @@ class AutoRejoinRobloxApp:
                     f"Packages terdeteksi : {len(self.packages)}",
                     f"Lobby delay        : {cfg['lobby_delay']} detik",
                     f"Join Target        : {join_target_label(cfg)}",
-                    f"Scheduled Rejoin   : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'} ({cfg['periodic_rejoin_interval_hours']} jam)",
+                    f"Periodic Full Restart: {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'} ({cfg['periodic_rejoin_interval_hours']} jam)",
                     "",
                     "[1] Mulai / Start AFK",
                     "[2] Setting",
@@ -2666,8 +3079,8 @@ class AutoRejoinRobloxApp:
                     f"2. Place ID    : {cfg['place_id']}",
                     f"3. Join mode   : {mode_label}",
                     "4. Set private server link",
-                    f"5. Scheduled Rejoin : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
-                    f"6. Rejoin interval  : {cfg['periodic_rejoin_interval_hours']} jam",
+                    f"5. Periodic Full Restart : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
+                    f"6. Full restart interval : {cfg['periodic_rejoin_interval_hours']} jam",
                     "",
                     "0. Kembali",
                 ],
@@ -2757,12 +3170,12 @@ class AutoRejoinRobloxApp:
                     periodic_rejoin_enabled=enabled,
                 )
                 self._safe_print(
-                    f"Scheduled Rejoin {'diaktifkan' if enabled else 'dinonaktifkan'}."
+                    f"Periodic Full Restart {'diaktifkan' if enabled else 'dinonaktifkan'}."
                 )
                 time.sleep(0.8)
             elif choice == "6":
                 try:
-                    hours = int(TerminalIO.safe_line_input("Interval rejoin (1-168 jam): ").strip())
+                    hours = int(TerminalIO.safe_line_input("Interval full restart (1-168 jam): ").strip())
                     if not 1 <= hours <= 168:
                         raise ValueError
                     self.config.update(
@@ -2770,7 +3183,7 @@ class AutoRejoinRobloxApp:
                         cfg["place_id"],
                         periodic_rejoin_interval_hours=hours,
                     )
-                    self._safe_print(f"Interval Scheduled Rejoin disimpan: {hours} jam.")
+                    self._safe_print(f"Interval full restart disimpan: {hours} jam.")
                 except (ValueError, KeyboardInterrupt, EOFError):
                     self._safe_print("Interval harus angka antara 1 sampai 168 jam.")
                 time.sleep(0.8)
