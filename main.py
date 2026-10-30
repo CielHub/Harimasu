@@ -165,7 +165,7 @@ THREADTIME_RE = re.compile(
 )
 
 ROBLOX_ERROR_RE = re.compile(
-    r"\b(264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
+    r"\b(264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)\b"
 )
 
 # Specific Roblox popup signature shown by the user: "Connection Failed"
@@ -183,9 +183,23 @@ CONNECTION_FAILED_279_RE = re.compile(
 # be near explicit error/code/disconnect/kick language to become a candidate.
 ROBLOX_ERROR_CONTEXT_RE = re.compile(
     r"(?:\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|"
-    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b"
-    r"|\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|600)\b.{0,24}"
+    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)\b"
+    r"|\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)\b.{0,24}"
     r"\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)\b)",
+    re.I,
+)
+
+# Roblox popup for error 529 ("An HTTP error has occurred..."). Explicit
+# wording is a strong signal; a bare "status/response 529" log line is an
+# ordinary HTTP status of some background request and must not trigger rejoin.
+HTTP_ERROR_529_RE = re.compile(
+    r"\berror\s*(?:code|id)\s*[:#= -]?\s*529\b"
+    r"|\bhttp\s+error\b.{0,120}\b529\b"
+    r"|\b529\b.{0,120}\bhttp\s+error\b",
+    re.I,
+)
+HTTP_STATUS_529_RE = re.compile(
+    r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:[_ ]code)?|response)\b.{0,18}\b529\b",
     re.I,
 )
 
@@ -2189,6 +2203,9 @@ class LogcatSensor(threading.Thread):
         # Roblox/error/disconnect condition. Iterate contextual matches instead
         # of trusting the first number in a line. If no valid code context is
         # found, still inspect crash signatures below rather than returning early.
+        if HTTP_ERROR_529_RE.search(text):
+            return "HTTP Error 529"
+
         for context_match in ROBLOX_ERROR_CONTEXT_RE.finditer(text):
             code_match = ROBLOX_ERROR_RE.search(context_match.group(0))
             if not code_match:
@@ -2197,6 +2214,12 @@ class LogcatSensor(threading.Thread):
             context_text = context_match.group(0)
             if code in {"403", "524"} and HTTP_OR_STATUS_RE.search(context_text):
                 continue
+            if code == "529":
+                # Look a little before the match: "status code 529" matches
+                # only from "code", so the HTTP/status word sits just before it.
+                lead = text[max(0, context_match.start() - 24):context_match.end()]
+                if HTTP_STATUS_529_RE.search(lead):
+                    continue
             if code == "277":
                 return "Disconnect 277"
             return f"Error {code}"
@@ -2215,7 +2238,7 @@ class LogcatSensor(threading.Thread):
         also pass immediately because they can appear only once before exit;
         ordinary error candidates require two matching events from the same PID.
         """
-        if reason in {"Error 267", "Disconnect 277", "Connection Failed 279"}:
+        if reason in {"Error 267", "Disconnect 277", "Connection Failed 279", "HTTP Error 529"}:
             return True
         if reason.startswith("Crash:"):
             # Crash signatures often occur only once immediately before the
