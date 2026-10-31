@@ -13,6 +13,8 @@ Features:
 - Separate in-game rejoin and full relaunch recovery paths.
 - Bounded per-package relaunch retries; recovery never uses SIGKILL.
 - Error-code policy: backoff, terminal errors and a per-instance circuit breaker.
+- Join verification: UDP socket + Roblox log markers confirm a clone is really in a game.
+- Join deep links are spaced out globally; unusable configs refuse to start (no silent fallback).
 - Config stored in config.json.
 
 Standard library only.
@@ -20,6 +22,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import queue
@@ -66,6 +69,22 @@ STARTUP_FAILURE_STATUSES = frozenset({"Launch Failed", "Join Failed", "Window Re
 LOGCAT_COMMAND_FILTERED = "exec logcat -v threadtime -b main -b system -b crash -T 1"
 LOGCAT_COMMAND_PLAIN = "exec logcat -v threadtime"
 LOGCAT_FALLBACK_WINDOW = 5.0
+
+# Join verification ("did this clone really reach a game server?").
+# While in a game Roblox keeps UDP sockets to the game server; in the lobby or
+# after a kick it does not (same signal other Android auto-rejoin tools use).
+# Roblox's per-app log file adds connect/disconnect markers as a second signal.
+SAFE_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+GAME_PROBE_INTERVAL = 5.0
+GAME_STABLE_RESET_SECONDS = 300.0
+UDP_IGNORED_REMOTE_PORTS = frozenset({"0035", "01BB"})  # DNS, QUIC
+GAME_LOG_GREP = (
+    "Connection accepted|serverId:|Disconnection Notification|"
+    "Sending disconnect with reason|Time to disconnect replication data|"
+    "Lost connection|Connection lost|You were kicked"
+)
+GAME_CONNECTED_RE = re.compile(r"Connection accepted|serverId:", re.I)
+GAME_LOG_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -82,6 +101,11 @@ DEFAULT_CONFIG = {
     "periodic_rejoin_max_retries": 2,
     "error_circuit_max_errors": 5,
     "error_circuit_window_minutes": 30,
+    "join_verify_enabled": True,
+    "join_verify_timeout": 120,
+    "join_verify_lost_grace": 60,
+    "join_verify_max_failures": 3,
+    "join_stagger_seconds": 20,
 }
 
 
@@ -127,7 +151,9 @@ def private_server_deep_link(link: str) -> str:
     if parsed.scheme.lower() != "https" or not is_roblox_host:
         raise ValueError("Gunakan link HTTPS dari domain roblox.com atau deep link Roblox yang didukung.")
 
-    path = parsed.path.rstrip("/").lower()
+    # Roblox adds a locale prefix to web URLs (e.g. /id/share, /id/games/...).
+    clean_path = re.sub(r"^/[a-z]{2}(?:-[a-z0-9]{2,4})?(?=/)", "", parsed.path, flags=re.I)
+    path = clean_path.rstrip("/").lower()
     if path == "/share":
         code = one("code")
         link_type = one("type")
@@ -136,7 +162,7 @@ def private_server_deep_link(link: str) -> str:
         return "roblox://navigation/share_links?" + urlencode({"code": code, "type": "Server"})
 
     # Older invite links commonly look like /games/<placeId>/...?...privateServerLinkCode=...
-    match = re.match(r"^/games/(\d+)(?:/|$)", parsed.path, re.I)
+    match = re.match(r"^/games/(\d+)(?:/|$)", clean_path, re.I)
     if match:
         place_id = match.group(1)
         link_code = one("privateServerLinkCode") or one("linkCode")
@@ -154,6 +180,22 @@ def join_target_label(cfg: dict) -> str:
     if cfg.get("join_mode") == "private_server_link":
         return "Private Server Link"
     return "Place ID " + str(cfg.get("place_id", DEFAULT_CONFIG["place_id"]))
+
+
+def config_problem(cfg: dict) -> Optional[str]:
+    """Return a human-readable reason why this config must not be used to start, else None."""
+    if cfg.get("join_mode") == "private_server_link":
+        link = str(cfg.get("private_server_link", "") or "")
+        if not link:
+            return "Mode Private Server aktif tapi link belum diisi (Setting opsi 4)."
+        try:
+            private_server_deep_link(link)
+        except ValueError as exc:
+            return f"Link private server di config tidak valid: {exc}"
+        return None
+    if str(cfg.get("place_id", "")) == DEFAULT_CONFIG["place_id"]:
+        return "Place ID masih nilai bawaan (123456789). Isi Place ID asli di Setting opsi 2."
+    return None
 
 
 # Exact PID is extracted from the logcat line. The PID must also belong to a
@@ -181,11 +223,14 @@ CONNECTION_FAILED_279_RE = re.compile(
 
 # A bare number or a generic tag named "Roblox" is not enough. The code must
 # be near explicit error/code/disconnect/kick language to become a candidate.
+_ERR_CODES = r"(?:264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)"
+_ERR_WORDS = r"(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)"
+# The code must sit right behind the keyword (only filler words such as
+# "reason"/"code" and one separator allowed), so "texture error: size 600 x 400"
+# or "kick count: 600 frames" can no longer pass as a Roblox error.
 ROBLOX_ERROR_CONTEXT_RE = re.compile(
-    r"(?:\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|"
-    r"kicked|kick)\b.{0,24}\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)\b"
-    r"|\b(?:264|266|267|268|270|273|275|277|279|280|286|403|524|529|600)\b.{0,24}"
-    r"\b(?:error(?:\s*(?:code|id))?|code|disconnect(?:ed|ion)?|kicked|kick)\b)",
+    rf"(?:\b{_ERR_WORDS}\b(?:\s+(?:reason|code|id|number|no\.?))*\s*[:#=\-(\[]?\s*\b{_ERR_CODES}\b"
+    rf"|\b{_ERR_CODES}\b\s*[:)\]\-]?\s*\b{_ERR_WORDS}\b)",
     re.I,
 )
 
@@ -198,8 +243,10 @@ HTTP_ERROR_529_RE = re.compile(
     r"|\b529\b.{0,120}\bhttp\s+error\b",
     re.I,
 )
-HTTP_STATUS_529_RE = re.compile(
-    r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:[_ ]code)?|response)\b.{0,18}\b529\b",
+# 403/524/529 are also ordinary HTTP status codes in background request logs.
+HTTP_STATUS_CODES = frozenset({"403", "524", "529"})
+HTTP_STATUS_LEAD_RE = re.compile(
+    r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:[_ ]code)?|response)\b.{0,18}\b(?:403|524|529)\b",
     re.I,
 )
 
@@ -248,6 +295,14 @@ class CommandResult:
     stderr: str
 
 
+@dataclass
+class GameProbe:
+    """One sample of "is this package inside a game?" evidence."""
+    udp_count: int                      # -1 = unknown (uid could not be read)
+    log_found: bool
+    log_events: List[Tuple[float, str]]  # (unix time, "connected" | "disconnect")
+
+
 class ConfigManager:
     """Load, validate, and atomically save config.json."""
 
@@ -275,22 +330,24 @@ class ConfigManager:
         if not place_id.isdigit():
             place_id = DEFAULT_CONFIG["place_id"]
 
+        # Never silently drop an unusable link or silently switch to Place ID:
+        # that would send every clone to a public game without any warning.
+        # config_problem() reports it and the bot refuses to start instead.
         private_server_link = str(data.get("private_server_link", "") or "").strip()
-        if private_server_link:
-            try:
-                private_server_deep_link(private_server_link)
-            except ValueError:
-                private_server_link = ""
+        if "\n" in private_server_link or "\r" in private_server_link or len(private_server_link) > 2048:
+            private_server_link = ""
 
         join_mode = data.get("join_mode", DEFAULT_CONFIG["join_mode"])
         if join_mode not in ("place_id", "private_server_link"):
-            join_mode = "place_id"
-        if join_mode == "private_server_link" and not private_server_link:
             join_mode = "place_id"
 
         enabled = data.get("periodic_rejoin_enabled", DEFAULT_CONFIG["periodic_rejoin_enabled"])
         if not isinstance(enabled, bool):
             enabled = DEFAULT_CONFIG["periodic_rejoin_enabled"]
+
+        verify_enabled = data.get("join_verify_enabled", DEFAULT_CONFIG["join_verify_enabled"])
+        if not isinstance(verify_enabled, bool):
+            verify_enabled = DEFAULT_CONFIG["join_verify_enabled"]
 
         def bounded_int(key: str, minimum: int, maximum: int) -> int:
             try:
@@ -312,6 +369,11 @@ class ConfigManager:
             "periodic_rejoin_max_retries": bounded_int("periodic_rejoin_max_retries", 0, 5),
             "error_circuit_max_errors": bounded_int("error_circuit_max_errors", 1, 50),
             "error_circuit_window_minutes": bounded_int("error_circuit_window_minutes", 1, 720),
+            "join_verify_enabled": verify_enabled,
+            "join_verify_timeout": bounded_int("join_verify_timeout", 30, 900),
+            "join_verify_lost_grace": bounded_int("join_verify_lost_grace", 15, 600),
+            "join_verify_max_failures": bounded_int("join_verify_max_failures", 1, 10),
+            "join_stagger_seconds": bounded_int("join_stagger_seconds", 0, 300),
         }
 
     def load(self) -> dict:
@@ -615,6 +677,86 @@ class AndroidShell:
         base = cmdline.split(":", 1)[0]
         return base == package
 
+    def game_probe(self, packages: List[str]) -> Dict[str, GameProbe]:
+        """One root call: UDP socket count + recent Roblox log markers per package."""
+        safe = [p for p in packages if SAFE_PACKAGE_RE.match(p)]
+        if not safe:
+            return {}
+        parts = ["cat /proc/net/udp /proc/net/udp6 2>/dev/null", "echo '@@END_UDP'"]
+        for pkg in safe:
+            parts.append(
+                f'echo "@@PKG {pkg} $(stat -c %u /data/data/{pkg} 2>/dev/null)"; '
+                f"f=$(ls -t /data/data/{pkg}/files/appData/logs/*.log 2>/dev/null | head -n 1); "
+                f'if [ -n "$f" ]; then echo "@@LOG"; '
+                f"tail -c 65536 \"$f\" 2>/dev/null | grep -aE '{GAME_LOG_GREP}' | tail -n 40; fi"
+            )
+        result = self.run_su("; ".join(parts), timeout=12)
+        if not result.stdout:
+            return {}
+        return self.parse_game_probe(result.stdout, safe)
+
+    @staticmethod
+    def _parse_log_event(line: str) -> Optional[Tuple[float, str]]:
+        match = GAME_LOG_TS_RE.match(line)
+        if not match:
+            return None
+        try:
+            stamp = float(calendar.timegm(tuple(int(x) for x in match.groups())))
+        except (ValueError, OverflowError):
+            return None
+        kind = "connected" if GAME_CONNECTED_RE.search(line) else "disconnect"
+        return stamp, kind
+
+    @staticmethod
+    def parse_game_probe(output: str, packages: List[str]) -> Dict[str, GameProbe]:
+        lines = output.splitlines()
+        udp_by_uid: Dict[int, int] = {}
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            index += 1
+            if line.startswith("@@END_UDP"):
+                break
+            fields = line.split()
+            if len(fields) < 8 or fields[0] == "sl":
+                continue
+            try:
+                uid = int(fields[7])
+            except ValueError:
+                continue
+            remote_port = fields[2].rsplit(":", 1)[-1].upper()
+            if remote_port in UDP_IGNORED_REMOTE_PORTS:
+                continue
+            udp_by_uid[uid] = udp_by_uid.get(uid, 0) + 1
+
+        probes: Dict[str, GameProbe] = {}
+        current: Optional[str] = None
+        uid_now: Optional[int] = None
+        log_found = False
+        events: List[Tuple[float, str]] = []
+
+        def flush() -> None:
+            if current and current in packages:
+                udp = udp_by_uid.get(uid_now, 0) if uid_now is not None else -1
+                probes[current] = GameProbe(udp, log_found, list(events))
+
+        for line in lines[index:]:
+            if line.startswith("@@PKG "):
+                flush()
+                bits = line.split()
+                current = bits[1] if len(bits) >= 2 else None
+                uid_now = int(bits[2]) if len(bits) >= 3 and bits[2].isdigit() else None
+                log_found = False
+                events = []
+            elif line.startswith("@@LOG"):
+                log_found = True
+            elif current:
+                event = AndroidShell._parse_log_event(line)
+                if event:
+                    events.append(event)
+        flush()
+        return probes
+
     def kill_exact_pid(self, pid: int, package: str) -> bool:
         """
         Stop the verified target package through Android Activity Manager.
@@ -689,6 +831,15 @@ class RobloxInstance:
         self.last_recovery_done_at = 0.0
         self.needs_attention = False
         self.attention_reason = ""
+        # Join verification state.
+        self.game_state = "unknown"  # unknown | joining | in_game | lost
+        self.game_watch_started = 0.0
+        self.game_watch_wall = 0.0
+        self.game_in_game_since = 0.0
+        self.game_lost_since = 0.0
+        self.game_failures = 0
+        self.game_evidence = ""
+        self.game_notice_sent = False
 
     def add_event(self, message: str) -> None:
         now = time.strftime("%H:%M:%S")
@@ -720,6 +871,10 @@ class RobloxInstance:
                 "periodic_rejoin_attempts": self.periodic_rejoin_attempts,
                 "periodic_rejoin_retry_at": self.periodic_rejoin_retry_at,
                 "needs_attention": self.needs_attention,
+                "recovery_busy": self.recovery_busy,
+                "game_state": self.game_state,
+                "game_watch_wall": self.game_watch_wall,
+                "game_failures": self.game_failures,
             }
 
     def update_pids(self, pids: List[int]) -> None:
@@ -867,6 +1022,7 @@ class RobloxInstance:
 
             self.last_successful_join_at = now
             self.periodic_schedule_anchor_at = now
+            self._restart_game_watch_locked(now)
             self.periodic_schedule_enabled = bool(periodic_enabled and periodic_interval_seconds)
             self.periodic_interval_seconds = (
                 max(1, int(periodic_interval_seconds))
@@ -1002,6 +1158,7 @@ class RobloxInstance:
                 self.process_loss_retry_after = 0.0
                 self.last_successful_join_at = now
                 self.periodic_schedule_anchor_at = now
+                self._restart_game_watch_locked(now)
                 self.next_periodic_rejoin_at = now + interval_seconds
                 self.periodic_rejoin_attempts = 0
                 self.periodic_rejoin_retry_at = None
@@ -1117,7 +1274,62 @@ class RobloxInstance:
             self.attention_reason = ""
             self.error_times.clear()
             self.backoff_level = 0
+            self.game_failures = 0
             return True
+
+    def _restart_game_watch_locked(self, now: float) -> None:
+        self.game_state = "joining"
+        self.game_watch_started = now
+        self.game_watch_wall = time.time()
+        self.game_in_game_since = 0.0
+        self.game_lost_since = 0.0
+        self.game_evidence = ""
+
+    def update_game_sample(self, in_game: bool, evidence: str, now: float) -> Optional[str]:
+        """Feed one probe result. Returns "joined" / "lost" on a transition."""
+        with self.lock:
+            if not self.active or self.game_state == "unknown":
+                return None
+            if in_game:
+                self.game_evidence = evidence
+                self.game_lost_since = 0.0
+                if self.game_state != "in_game":
+                    self.game_state = "in_game"
+                    self.game_in_game_since = now
+                    self.game_notice_sent = False
+                    return "joined"
+                if self.game_failures and now - self.game_in_game_since >= GAME_STABLE_RESET_SECONDS:
+                    self.game_failures = 0
+                return None
+            if self.game_state == "in_game":
+                self.game_state = "lost"
+                self.game_lost_since = now
+                return "lost"
+            return None
+
+    def game_verdict(self, now: float, join_timeout: float, lost_grace: float) -> Optional[str]:
+        with self.lock:
+            if self.game_state == "joining" and now - self.game_watch_started >= join_timeout:
+                return "No Game"
+            if (
+                self.game_state == "lost"
+                and self.game_lost_since
+                and now - self.game_lost_since >= lost_grace
+            ):
+                return "Game Lost"
+            return None
+
+    def note_game_failure(self) -> int:
+        with self.lock:
+            self.game_failures += 1
+            return self.game_failures
+
+    def mark_attention(self, status: str, reason: str) -> None:
+        with self.lock:
+            self.needs_attention = True
+            self.attention_reason = reason
+            self.online_since = None
+            self.status = status
 
 
 class RobloxManager:
@@ -1130,6 +1342,11 @@ class RobloxManager:
         self.pid_map: Dict[int, str] = {}
         self.pid_map_lock = threading.RLock()
         self.startup_semaphore = threading.Semaphore(STARTUP_CONCURRENCY)
+        # Join deep links are spaced out globally. All clones share one private
+        # server, so a server shutdown kicks them all at once; without spacing
+        # they would all reconnect in the same second and overload the phone.
+        self.join_slot_lock = threading.Lock()
+        self.last_join_sent = 0.0
         # True while the selected clones are going through the initial
         # sequential boot + lobby + map + stabilization sequence. During this
         # window Logcat errors are treated as startup noise and must not cancel
@@ -1138,6 +1355,10 @@ class RobloxManager:
         # Packages currently inside their own launch + stabilization window.
         # Only these ignore Logcat errors; already-Running siblings stay armed.
         self.launching_packages: set[str] = set()
+        # True once any clone was seen inside a game by the probe. Until then
+        # join verification only observes, so a device where the signals do
+        # not work can never trigger false "not in game" actions.
+        self.game_signal_verified = False
         self.startup_run_id = 0
         self._last_window_scan = 0.0
         self._last_window_scan_success = False
@@ -1246,6 +1467,7 @@ class RobloxManager:
             startup_run_id = self.startup_run_id
             self.startup_in_progress = True
             self.launching_packages = set()
+            self.game_signal_verified = False
             self._last_window_scan = 0.0
             self._last_window_scan_success = False
             self._window_packages_cache = set()
@@ -1312,6 +1534,19 @@ class RobloxManager:
                 if self.startup_run_id == startup_run_id:
                     self.startup_in_progress = False
                     self.launching_packages.clear()
+
+    def _acquire_join_slot(self, instance: RobloxInstance, generation: int, gap: float) -> bool:
+        """Wait until at least `gap` seconds passed since the previous join deep link."""
+        with self.join_slot_lock:
+            while True:
+                if self.shutdown_event.is_set() or not instance.is_current(generation):
+                    return False
+                wait = self.last_join_sent + gap - time.monotonic()
+                if wait <= 0:
+                    break
+                self.shutdown_event.wait(min(0.5, wait))
+            self.last_join_sent = time.monotonic()
+            return True
 
     def _startup_one(self, instance: RobloxInstance) -> bool:
         """Launch one package; retry bounded times on failure. False aborts the whole startup."""
@@ -1443,6 +1678,8 @@ class RobloxManager:
 
         instance.add_event(f"Joining {join_target_label(cfg)}")
         instance.set_status("Joining")
+        if not self._acquire_join_slot(instance, generation, float(cfg.get("join_stagger_seconds", 20))):
+            return False
         with self.startup_semaphore:
             join_result = self.shell.open_join_target(package, cfg)
         if join_result.code != 0:
@@ -1654,6 +1891,8 @@ class RobloxManager:
         cfg = self.config.load()
         instance.add_event(f"Rejoining {join_target_label(cfg)}")
         instance.set_status("Rejoining")
+        if not self._acquire_join_slot(instance, generation, float(cfg.get("join_stagger_seconds", 20))):
+            return
 
         # Recovery bypasses the normal launch flow: keep the Roblox process
         # alive and send only the deep-link intent to the target package.
@@ -1900,6 +2139,96 @@ class RobloxManager:
         with self.pid_map_lock:
             self.pid_map = new_map
 
+    @staticmethod
+    def _game_evidence(probe: GameProbe, watch_wall: float) -> Tuple[bool, str]:
+        events = [e for e in probe.log_events if e[0] >= watch_wall - 3.0]
+        last = events[-1][1] if events else ""
+        if last == "disconnect":
+            return False, "log-disconnect"
+        if probe.udp_count > 0:
+            return True, f"udp={probe.udp_count}"
+        if last == "connected":
+            return True, "log"
+        return False, ""
+
+    def check_game_states(self) -> None:
+        """Verify each clone really is in a game; retry the ones that are not.
+
+        Ladder per instance: resend the join (via the normal recovery cycle,
+        with backoff) -> force-stop + full relaunch -> stop and flag "Attn".
+        """
+        cfg = self.config.load()
+        if not cfg.get("join_verify_enabled", True):
+            return
+        instances = [i for i in self.instances_snapshot() if i.snapshot()["active"]]
+        if not instances:
+            return
+        probes = self.shell.game_probe([i.package for i in instances])
+        if not probes:
+            return
+
+        join_timeout = float(cfg["join_verify_timeout"])
+        lost_grace = float(cfg["join_verify_lost_grace"])
+        max_failures = int(cfg["join_verify_max_failures"])
+        now = time.monotonic()
+
+        for instance in instances:
+            probe = probes.get(instance.package)
+            if probe is None:
+                continue
+            snap = instance.snapshot()
+            in_game, evidence = self._game_evidence(probe, snap["game_watch_wall"])
+            transition = instance.update_game_sample(in_game, evidence, now)
+            if transition == "joined":
+                with self.lock:
+                    first = not self.game_signal_verified
+                    self.game_signal_verified = True
+                instance.add_event(f"In game ({evidence})")
+                if first:
+                    instance.add_event("Join verification armed")
+            elif transition == "lost":
+                instance.add_event("Game connection lost; waiting grace period")
+
+            verdict = instance.game_verdict(now, join_timeout, lost_grace)
+            if not verdict:
+                continue
+            if not self.game_signal_verified:
+                if not instance.game_notice_sent:
+                    instance.game_notice_sent = True
+                    instance.add_event("No in-game signal seen yet; verification inactive")
+                continue
+
+            snap = instance.snapshot()
+            with self.lock:
+                launching = instance.package in self.launching_packages
+            if (
+                not snap["active"]
+                or snap["status"] != "Running"
+                or snap["process_loss_queued"]
+                or snap["recovery_busy"]
+                or snap["periodic_rejoin_in_progress"]
+                or snap["needs_attention"]
+                or launching
+                or not snap["pids"]
+            ):
+                continue
+
+            failures = snap["game_failures"] + 1
+            pid = snap["pids"][0]
+            if failures > max_failures:
+                instance.mark_attention("Attn: join", f"{verdict} x{failures - 1}")
+                instance.add_event(f"{verdict}: still not in game after {failures - 1} tries; press c to retry")
+                continue
+            if failures == 1:
+                if instance.can_queue_recovery(pid, verdict):
+                    instance.note_game_failure()
+                    instance.add_event(f"{verdict}: resending join")
+                continue
+            instance.note_game_failure()
+            instance.add_event(f"{verdict}: force-stop + relaunch (try {failures}/{max_failures})")
+            self.shell.kill_exact_pid(pid, instance.package)
+            self._start_full_relaunch(instance, f"{verdict} verification")
+
     def clear_attention(self) -> int:
         """Manual retry for instances stopped by a terminal error or the circuit breaker."""
         cleared = 0
@@ -1942,6 +2271,23 @@ class PidMonitor(threading.Thread):
             except Exception:
                 pass
             self.stop_event.wait(1.0)
+
+
+class GameStateMonitor(threading.Thread):
+    """Periodically verifies that every clone is really inside a game."""
+
+    def __init__(self, manager: RobloxManager, stop_event: threading.Event):
+        super().__init__(name="game-state-monitor", daemon=True)
+        self.manager = manager
+        self.stop_event = stop_event
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.manager.check_game_states()
+            except Exception:
+                pass
+            self.stop_event.wait(GAME_PROBE_INTERVAL)
 
 
 class ScheduledRejoinWorker(threading.Thread):
@@ -2212,13 +2558,11 @@ class LogcatSensor(threading.Thread):
                 continue
             code = code_match.group(1)
             context_text = context_match.group(0)
-            if code in {"403", "524"} and HTTP_OR_STATUS_RE.search(context_text):
-                continue
-            if code == "529":
-                # Look a little before the match: "status code 529" matches
+            if code in HTTP_STATUS_CODES:
+                # Look a little before the match: "status code 403" matches
                 # only from "code", so the HTTP/status word sits just before it.
                 lead = text[max(0, context_match.start() - 24):context_match.end()]
-                if HTTP_STATUS_529_RE.search(lead):
+                if HTTP_STATUS_LEAD_RE.search(lead) or HTTP_OR_STATUS_RE.search(context_text):
                     continue
             if code == "277":
                 return "Disconnect 277"
@@ -2431,6 +2775,12 @@ class Dashboard:
         return text.ljust(width)
 
     @staticmethod
+    def _game_label(snap: dict) -> str:
+        return {"in_game": "InGame", "joining": "Joining", "lost": "Lost"}.get(
+            snap.get("game_state", "unknown"), "-"
+        )
+
+    @staticmethod
     def _uptime(online_since: Optional[float]) -> str:
         if online_since is None:
             return "--:--:--"
@@ -2453,7 +2803,8 @@ class Dashboard:
         pid_w = 7
         online_w = 8
         status_w = 13
-        package_w = max(12, inner - (num_w + pid_w + online_w + status_w + 8))
+        game_w = 8
+        package_w = max(12, inner - (num_w + pid_w + online_w + status_w + game_w + 9))
 
         def row_text(index: int, snap: dict) -> str:
             pids = snap["pids"]
@@ -2466,6 +2817,7 @@ class Dashboard:
                 self._fit(pid_text, pid_w),
                 self._fit(self._uptime(snap["online_since"]), online_w),
                 self._fit(snap["status"], status_w),
+                self._fit(self._game_label(snap), game_w),
             ]
             return " ".join(parts)
 
@@ -2475,12 +2827,13 @@ class Dashboard:
             self._fit("PID", pid_w),
             self._fit("Online", online_w),
             self._fit("Status", status_w),
+            self._fit("Game", game_w),
         ])
 
         lines = [
             f"+{'=' * inner}+",
             f"|{self._fit(APP_NAME, inner)}|",
-            f"|{self._fit('Join: '+join_target_label(cfg)+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h', inner)}|",
+            f"|{self._fit('Join: '+join_target_label(cfg)+' | Lobby: '+str(cfg['lobby_delay'])+'s | Rejoin: '+('ON' if cfg['periodic_rejoin_enabled'] else 'OFF')+' '+str(cfg['periodic_rejoin_interval_hours'])+'h | Verify: '+('ON' if cfg.get('join_verify_enabled', True) else 'OFF'), inner)}|",
             f"+{'-' * inner}+",
             f"|{self._fit(header, inner)}|",
             f"+{'-' * inner}+",
@@ -2508,7 +2861,7 @@ class Dashboard:
                 if len(pids) > 1:
                     pid_text += f"+{len(pids)-1}"
                 package = snap["package"]
-                line1 = f"{index}. {package}"
+                line1 = f"{index}. {package} [{self._game_label(snap)}]"
                 line2 = f"PID:{pid_text}  ON:{self._uptime(snap['online_since'])}"
                 line2 += f"  {snap['status']}"
                 lines.append(f"|{self._fit(line1, inner)}|")
@@ -2593,6 +2946,7 @@ class AutoRejoinRobloxApp:
         self.pid_monitor = PidMonitor(self.manager, self.shutdown_event)
         self.logcat_sensor = LogcatSensor(self.manager, self.shutdown_event)
         self.scheduled_rejoin_worker = ScheduledRejoinWorker(self.manager, self.shutdown_event)
+        self.game_monitor = GameStateMonitor(self.manager, self.shutdown_event)
         self.packages: List[str] = []
 
     def run(self) -> None:
@@ -2623,6 +2977,8 @@ class AutoRejoinRobloxApp:
             self.logcat_sensor.start()
         if not self.scheduled_rejoin_worker.is_alive():
             self.scheduled_rejoin_worker.start()
+        if not self.game_monitor.is_alive():
+            self.game_monitor.start()
 
     def _box(self, lines: List[str], title: Optional[str] = None) -> None:
         """Render a compact left-aligned box that survives portrait mode."""
@@ -2706,6 +3062,15 @@ class AutoRejoinRobloxApp:
             time.sleep(1.2)
             return
 
+        problem = config_problem(self.config.load())
+        if problem:
+            self._box([problem, "", "Perbaiki di menu Setting, lalu coba lagi.", "Tekan Enter untuk kembali."], "KONFIGURASI")
+            try:
+                input("")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            return
+
         selected_packages = [self.packages[i - 1] for i in selected]
         self.manager.start_sessions(selected_packages)
         dashboard = Dashboard(self.manager, self.shutdown_event)
@@ -2735,6 +3100,7 @@ class AutoRejoinRobloxApp:
                     "4. Set private server link",
                     f"5. Scheduled Rejoin : {'ON' if cfg['periodic_rejoin_enabled'] else 'OFF'}",
                     f"6. Rejoin interval  : {cfg['periodic_rejoin_interval_hours']} jam",
+                    f"7. Verifikasi masuk game : {'ON' if cfg['join_verify_enabled'] else 'OFF'}",
                     "",
                     "0. Kembali",
                 ],
@@ -2841,6 +3207,17 @@ class AutoRejoinRobloxApp:
                 except (ValueError, KeyboardInterrupt, EOFError):
                     self._safe_print("Interval harus angka antara 1 sampai 168 jam.")
                 time.sleep(0.8)
+            elif choice == "7":
+                enabled = not cfg["join_verify_enabled"]
+                self.config.update(
+                    cfg["lobby_delay"],
+                    cfg["place_id"],
+                    join_verify_enabled=enabled,
+                )
+                self._safe_print(
+                    f"Verifikasi masuk game {'diaktifkan' if enabled else 'dinonaktifkan'}."
+                )
+                time.sleep(0.8)
             else:
                 self._safe_print("Pilihan tidak valid.")
                 time.sleep(0.8)
@@ -2857,7 +3234,7 @@ class AutoRejoinRobloxApp:
         except Exception:
             pass
 
-        for thread in (self.pid_monitor, self.logcat_sensor, self.scheduled_rejoin_worker):
+        for thread in (self.pid_monitor, self.logcat_sensor, self.scheduled_rejoin_worker, self.game_monitor):
             try:
                 thread.join(timeout=3)
             except Exception:
